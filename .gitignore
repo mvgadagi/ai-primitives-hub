@@ -162,6 +162,7 @@ post-compile-fixes-cross-platform.js
 !package.json
 !package-lock.json
 !tsconfig*.json
+!renovate.json
 .c8_output/
 
 # Cache directories
