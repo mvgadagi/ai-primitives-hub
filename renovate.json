@@ -1,0 +1,51 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommits"],
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 2,
+  "labels": ["dependencies"],
+  "minimumReleaseAge": "3 days",
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "labels": ["security"]
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 5am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Group non-major npm updates across the pnpm monorepo (packages/*, apps/*, github-actions/*, lib, website)",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "npm non-major dependencies"
+    },
+    {
+      "description": "Group ESLint and related plugins/config",
+      "matchPackageNames": ["/^eslint/", "/^@o3r\\/eslint-config/", "/^globals$/"],
+      "groupName": "eslint"
+    },
+    {
+      "description": "Group Mocha test-tooling ecosystem",
+      "matchPackageNames": ["/^mocha/", "/^chai/", "/^sinon/"],
+      "groupName": "mocha test tooling"
+    },
+    {
+      "description": "Group GitHub Actions updates separately from npm updates",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions"
+    },
+    {
+      "description": "Group Node.js and pnpm runtime version bumps (engines and packageManager fields) across all manifests",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["engines", "packageManager"],
+      "groupName": "node and pnpm runtime"
+    },
+    {
+      "description": "Automerge low-risk devDependency minor/patch updates after CI passes",
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true
+    }
+  ]
+}
