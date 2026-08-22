@@ -47,6 +47,12 @@ export interface SourceAdapter {
   /** URL for UI display/debugging only — not used for the actual download. */
   getDownloadUrl(bundleId: string, version?: string): string;
 
+  /**
+   * Download a bundle's README text, if available.
+   * Returns `null` when no README is defined or the download fails.
+   */
+  downloadReadme(bundle: Bundle): Promise<string | null>;
+
   /** Optional: force re-authentication (e.g. after a token expires). */
   forceAuthentication?(): Promise<void>;
 }

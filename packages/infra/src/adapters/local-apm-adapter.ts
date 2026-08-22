@@ -55,6 +55,7 @@ import {
 import {
   isValidLocalUrl,
   resolveLocalPath,
+  toFileUrl,
 } from './local-path';
 
 const DEFAULT_MAX_DEPTH = 2;
@@ -127,7 +128,8 @@ function titleCase(value: string): string {
     .join(' ');
 }
 
-function detectFileType(filename: string): 'prompt' | 'instructions' | 'chatmode' | 'agent' {
+function detectFileType(filePath: string): 'prompt' | 'instructions' | 'chatmode' | 'agent' {
+  const filename = path.basename(filePath);
   if (filename.endsWith('.instructions.md')) {
     return 'instructions';
   }
@@ -135,6 +137,11 @@ function detectFileType(filename: string): 'prompt' | 'instructions' | 'chatmode
     return 'chatmode';
   }
   if (filename.endsWith('.agent.md')) {
+    return 'agent';
+  }
+  // VS Code no longer requires .agent.md suffix — any .md in agents/ is an agent
+  const normalized = filePath.replace(/\\/g, '/');
+  if (/(?:^|[/])agents[/]/i.test(normalized) && filename.endsWith('.md')) {
     return 'agent';
   }
   return 'prompt';
@@ -210,9 +217,9 @@ export class LocalApmAdapter extends BaseSourceAdapter {
       size: formatDependencyCount(manifest.dependencies?.apm),
       dependencies: mapDependencies(manifest.dependencies?.apm),
       license: manifest.license ?? 'MIT',
-      manifestUrl: `file://${path.join(packageDir, 'apm.yml')}`,
-      downloadUrl: `file://${packageDir}`,
-      repository: `file://${this.getLocalPath()}`
+      manifestUrl: toFileUrl(path.join(packageDir, 'apm.yml')),
+      downloadUrl: toFileUrl(packageDir),
+      repository: toFileUrl(this.getLocalPath())
     };
   }
 
@@ -264,6 +271,9 @@ export class LocalApmAdapter extends BaseSourceAdapter {
           }
         } else if (PROMPT_EXTENSIONS.some((ext) => entry.name.endsWith(ext))) {
           files.push(fullPath);
+        } else if (entry.name.endsWith('.md') && /(?:^|[/])agents[/]/i.test(fullPath.replace(/\\/g, '/'))) {
+          // VS Code no longer requires .agent.md suffix — any .md in agents/ is an agent
+          files.push(fullPath);
         }
       }
     };
@@ -290,13 +300,13 @@ export class LocalApmAdapter extends BaseSourceAdapter {
     const promptFiles = await this.findPromptFiles(packageDir, true);
     const prompts = promptFiles.map((file) => {
       const filename = path.basename(file);
-      const id = filename.replace(/\.(prompt|instructions|agent|chatmode)\.md$/, '');
+      const id = filename.replace(/\.(prompt|instructions|agent|chatmode)\.md$/, '').replace(/\.md$/, '');
       return {
         id,
         name: titleCase(id.replace(/-/g, ' ')),
         description: `From ${bundle.name}`,
         file: `prompts/${filename}`,
-        type: detectFileType(filename),
+        type: detectFileType(file),
         tags: apmManifest.tags ?? []
       };
     });
@@ -375,7 +385,7 @@ export class LocalApmAdapter extends BaseSourceAdapter {
   }
 
   public async downloadBundle(bundle: Bundle): Promise<Buffer> {
-    const packageDir = bundle.downloadUrl.startsWith('file://') ? bundle.downloadUrl.slice('file://'.length) : bundle.downloadUrl;
+    const packageDir = resolveLocalPath(bundle.downloadUrl);
     if (!(await this.directoryExists(packageDir))) {
       throw new Error(`Package directory not found: ${packageDir}`);
     }
@@ -424,7 +434,7 @@ export class LocalApmAdapter extends BaseSourceAdapter {
   }
 
   public getManifestUrl(bundleId: string): string {
-    return `file://${path.join(this.getLocalPath(), bundleId, 'apm.yml')}`;
+    return toFileUrl(path.join(this.getLocalPath(), bundleId, 'apm.yml'));
   }
 
   public getDownloadUrl(bundleId: string): string {

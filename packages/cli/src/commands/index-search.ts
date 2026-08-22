@@ -9,6 +9,13 @@
  * with `--index <FILE>`.
  * @module commands/index-search
  */
+import * as path from 'node:path';
+import {
+  canonicalizeIndexHubId,
+  resolveUserConfigPaths,
+  searchIndex,
+  SearchIndexError,
+} from '@ai-primitives-hub/app';
 import {
   generateSourceId,
 } from '@ai-primitives-hub/core';
@@ -19,18 +26,23 @@ import type {
   TokenProvider,
 } from '@ai-primitives-hub/core';
 import {
+  ActiveHubStore,
+  AppStoragePrimitiveIndexStore,
   defaultIndexFile,
   defaultTokenProvider,
-  loadIndex,
+  HubStore,
   NodeHttpClient,
   readTargets,
+  XdgAppStorage,
 } from '@ai-primitives-hub/infra';
 import type {
   PrimitiveKind,
   SearchQuery,
   SearchResult,
 } from '@ai-primitives-hub/infra';
-import inquirer from 'inquirer';
+import {
+  loadInquirer,
+} from '../framework';
 import {
   Command,
   type Context,
@@ -47,6 +59,30 @@ import {
 } from './install';
 
 type SearchCandidate = { bundleId: string; version: string; source: RegistrySource };
+
+async function resolveActiveHubSources(
+  ctx: Context,
+  mgr: ReturnType<typeof createHubManager>
+): Promise<RegistrySource[] | null> {
+  const active = await mgr.getActiveHub();
+  if (active !== null) {
+    return active.config.sources;
+  }
+
+  const userPaths = resolveUserConfigPaths(ctx.env);
+  const legacyRoot = path.join(path.dirname(userPaths.root), 'prompt-registry');
+  const legacyActiveStore = new ActiveHubStore(path.join(legacyRoot, 'active-hub.json'), ctx.fs);
+  const legacyHubId = await legacyActiveStore.get();
+  if (legacyHubId === null) {
+    return null;
+  }
+  const legacyStore = new HubStore(path.join(legacyRoot, 'hubs'), ctx.fs);
+  if (!(await legacyStore.has(legacyHubId))) {
+    return null;
+  }
+  const legacyHub = await legacyStore.load(legacyHubId);
+  return legacyHub.config.sources;
+}
 
 function buildSearchCandidates(sources: RegistrySource[], hits: SearchResult['hits']): SearchCandidate[] {
   const sourceById = new Map<string, RegistrySource>();
@@ -71,6 +107,8 @@ function buildSearchCandidates(sources: RegistrySource[], hits: SearchResult['hi
 }
 
 async function selectBundleIds(candidates: SearchCandidate[], interactive: boolean, ctx: Context): Promise<string[] | null> {
+  const inquirer = await loadInquirer();
+
   if (!interactive) {
     return candidates.map((c) => c.bundleId);
   }
@@ -129,16 +167,17 @@ async function searchAndInstall(
   ctx: Context,
   fmt: OutputFormat
 ): Promise<number> {
+  const inquirer = await loadInquirer();
   const http = opts.http ?? new NodeHttpClient();
   const tokens = opts.tokens ?? defaultTokenProvider(ctx.env);
   const mgr = createHubManager({ ctx, http, tokens });
-  const active = await mgr.getActiveHub();
-  if (active === null) {
+  const activeSources = await resolveActiveHubSources(ctx, mgr);
+  if (activeSources === null) {
     ctx.stderr.write('No active hub found. Run `ai-primitives-hub hub use <id>` first.\n');
     return 1;
   }
 
-  const candidates = buildSearchCandidates(active.config.sources, result.hits);
+  const candidates = buildSearchCandidates(activeSources, result.hits);
 
   if (candidates.length === 0) {
     ctx.stdout.write('No bundles from the active hub matched the search results.\n');
@@ -208,7 +247,10 @@ const classifyError = (cause: unknown, indexPath: string): RegistryError => {
 };
 
 const renderSearchText = (r: SearchResult): string => {
-  const lines: string[] = [`total: ${String(r.total)}  took: ${String(r.tookMs)}ms`];
+  const lines: string[] = [
+    `total: ${String(r.total)}  took: ${String(r.tookMs)}ms`,
+    `profile: ${r.searchProfileId ?? 'unknown'}  ranking: ${r.ranking ?? 'unknown'}  embeddings: ${String(r.embeddingUsed === true)}`
+  ];
   for (const hit of r.hits) {
     const p = hit.primitive;
     lines.push(
@@ -221,6 +263,34 @@ const renderSearchText = (r: SearchResult): string => {
   }
   return lines.join('\n') + '\n';
 };
+
+async function resolveDefaultIndexPath(ctx: Context, ranking: string | undefined): Promise<string> {
+  const profileIds = ranking === 'hybrid'
+    ? ['ternlight-single-v1']
+    : (ranking === 'multi'
+      ? ['ternlight-dual-v1']
+      : ['ternlight-dual-v1', 'ternlight-single-v1', 'bm25-v1']);
+  const userPaths = resolveUserConfigPaths(ctx.env);
+  const legacyRoot = path.join(path.dirname(userPaths.root), 'prompt-registry');
+  const activePointers = [
+    userPaths.activeHub,
+    path.join(legacyRoot, 'active-hub.json')
+  ];
+  const store = new AppStoragePrimitiveIndexStore(new XdgAppStorage(ctx.env));
+  for (const activePointer of activePointers) {
+    const activeHubId = await new ActiveHubStore(activePointer, ctx.fs).get();
+    if (activeHubId !== null) {
+      const indexHubId = canonicalizeIndexHubId(activeHubId);
+      for (const profileId of profileIds) {
+        const latest = await store.findLatestIndexPath(indexHubId, profileId);
+        if (latest !== undefined) {
+          return latest;
+        }
+      }
+    }
+  }
+  return defaultIndexFile(ctx.env);
+}
 
 /**
  * Index search command class.
@@ -246,6 +316,7 @@ export class IndexSearchCommand extends Command {
         --limit <n>              Limit number of results
         --offset <n>             Skip first n results
         --explain                 Show search scoring explanation
+        --ranking <bm25|hybrid|multi>  Ranking strategy (default: bm25)
         --install                Install matching primitives
         --interactive            Interactive mode for installation
         --install-target <name>  Target name for installation
@@ -254,6 +325,7 @@ export class IndexSearchCommand extends Command {
       Examples:
         ai-primitives-hub index search "docker"
         ai-primitives-hub index search --query "docker" --kinds skill
+        ai-primitives-hub index search --query "docker" --ranking hybrid
         ai-primitives-hub index search --sources github --limit 10
     `
   });
@@ -269,6 +341,7 @@ export class IndexSearchCommand extends Command {
   public limit = Option.String('--limit');
   public offset = Option.String('--offset');
   public explain = Option.Boolean('--explain');
+  public ranking = Option.String('--ranking');
   public install = Option.Boolean('--install', false);
   public interactive = Option.Boolean('--interactive', false);
   public installTarget = Option.String('--install-target');
@@ -278,10 +351,17 @@ export class IndexSearchCommand extends Command {
     const { ctx } = this.commandContext;
 
     const fmt = (this.output ?? 'text') as OutputFormat;
-    const indexPath = this.index ?? defaultIndexFile(ctx.env);
+    const indexPath = this.index ?? await resolveDefaultIndexPath(ctx, this.ranking);
+
+    if (this.ranking !== undefined && this.ranking !== 'bm25' && this.ranking !== 'hybrid' && this.ranking !== 'multi') {
+      return failWith(ctx, fmt, 'index.search', new RegistryError({
+        code: 'USAGE.INVALID_FLAG',
+        message: `Invalid --ranking value: ${this.ranking}`,
+        hint: 'Use `bm25` (default), `hybrid`, or `multi`.'
+      }));
+    }
 
     try {
-      const idx = loadIndex(indexPath);
       const query: SearchQuery = {
         q: this.query,
         kinds: this.kinds as PrimitiveKind[],
@@ -291,9 +371,10 @@ export class IndexSearchCommand extends Command {
         installedOnly: this.installedOnly,
         limit: this.limit ? Number.parseInt(this.limit, 10) : undefined,
         offset: this.offset ? Number.parseInt(this.offset, 10) : undefined,
-        explain: this.explain
+        explain: this.explain,
+        ranking: this.ranking
       };
-      const result = idx.search(query);
+      const result = await searchIndex({ indexPath, query, ranking: query.ranking });
       formatOutput({
         ctx,
         command: 'index.search',
@@ -312,6 +393,12 @@ export class IndexSearchCommand extends Command {
       }
       return 0;
     } catch (cause) {
+      if (cause instanceof SearchIndexError) {
+        return failWith(ctx, fmt, 'index.search', new RegistryError({
+          code: `INDEX.${cause.code}`,
+          message: cause.message
+        }));
+      }
       return failWith(ctx, fmt, 'index.search', classifyError(cause, indexPath));
     }
   }

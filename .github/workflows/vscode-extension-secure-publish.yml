@@ -27,7 +27,7 @@ permissions:
 
 env:
   NODE_VERSION: "24"
-  EXTENSION_DIR: "."
+  EXTENSION_DIR: "apps/vscode-extension"
   EXTENSION_NAME: "prompt-registry"
 
 jobs:
@@ -55,16 +55,10 @@ jobs:
           egress-policy: audit
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
-
-      - name: Verify release authenticity
-        if: github.event_name == 'release'
-        run: |
-          # Verify the release is properly signed and from authorized user
-          echo "Verifying release authenticity..."
 
       - name: Determine version and prerelease status
         id: version
@@ -89,18 +83,20 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: "npm"
-          cache-dependency-path: "${{ env.EXTENSION_DIR }}/package-lock.json"
+          cache: "pnpm"
+          cache-dependency-path: "pnpm-lock.yaml"
 
-      - name: Install dependencies with integrity check
-        working-directory: ${{ env.EXTENSION_DIR }}
+      - name: Install workspace dependencies with integrity check
         run: |
-          npm ci --fund=false
-          npm audit --omit=dev --audit-level=moderate
+          pnpm install --frozen-lockfile --prefer-offline
+          pnpm audit --prod --audit-level=moderate
 
       - name: Update version in package.json
         working-directory: ${{ env.EXTENSION_DIR }}
@@ -118,21 +114,18 @@ jobs:
           skip-dirs: "website,lib"
 
       - name: Build and package extension
-        working-directory: ${{ env.EXTENSION_DIR }}
         run: |
-          npm run compile
-          npm install -g @vscode/vsce
-
-          npm run package:prepare
+          pnpm run build
+          pnpm -C ${{ env.EXTENSION_DIR }} run package:prepare
 
           # Package with integrity verification
           if [ "${{ steps.version.outputs.is_prerelease }}" = "true" ]; then
-            vsce package --pre-release --out ${{env.EXTENSION_NAME}}-${{ steps.version.outputs.version }}.vsix
+            pnpm -C ${{ env.EXTENSION_DIR }} exec vsce package --pre-release --no-dependencies --out ${{env.EXTENSION_NAME}}-${{ steps.version.outputs.version }}.vsix
           else
-            vsce package --out ${{env.EXTENSION_NAME}}-${{ steps.version.outputs.version }}.vsix
+            pnpm -C ${{ env.EXTENSION_DIR }} exec vsce package --no-dependencies --out ${{env.EXTENSION_NAME}}-${{ steps.version.outputs.version }}.vsix
           fi
 
-          npm run package:cleanup
+          pnpm -C ${{ env.EXTENSION_DIR }} run package:cleanup
 
       - name: Generate package checksums and attestation
         id: package
@@ -153,12 +146,12 @@ jobs:
           echo "Package SHA256: $SHA256"
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: extension-package
           path: |
-            ${{ env.EXTENSION_NAME }}-${{ steps.version.outputs.version }}.vsix
-            checksums.txt
+            ${{ env.EXTENSION_DIR }}/${{ env.EXTENSION_NAME }}-${{ steps.version.outputs.version }}.vsix
+            ${{ env.EXTENSION_DIR }}/checksums.txt
 
   # Generate SLSA provenance
   provenance:
@@ -172,7 +165,6 @@ jobs:
     with:
       base64-subjects: "${{ needs.pre-publish-security.outputs.subjects }}"
       upload-assets: true
-      continue-on-error: true
 
   # Publish to VS Code Marketplace
   publish-marketplace:
@@ -212,7 +204,7 @@ jobs:
           fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -274,7 +266,7 @@ jobs:
           fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -292,7 +284,7 @@ jobs:
           fi
 
           # Publish with explicit package path
-          ovsx publish ${{env.EXTENSION_NAME}}-${{ needs.pre-publish-security.outputs.version }}.vsix -p $OVSX_PAT
+          ovsx publish "${{env.EXTENSION_NAME}}-${{ needs.pre-publish-security.outputs.version }}.vsix" -p "$OVSX_PAT"
 
   # Create installation bundles
   create-bundles:
@@ -312,7 +304,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -320,11 +312,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: extension-package
-
-      - name: Download provenance
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.provenance.outputs.provenance-name }}
 
       - name: Create installation bundle
         run: |
@@ -335,14 +322,14 @@ jobs:
           cp checksums.txt installation-bundle/
 
           # Copy provenance
-          cp *.intoto.jsonl installation-bundle/ || true
+          cp ./*.intoto.jsonl installation-bundle/ 2>/dev/null || true
 
           # Create installation script
           cat > installation-bundle/install.sh << 'INSTALL_EOF'
           #!/bin/bash
           set -e
 
-          echo "Installing Prompt Registry VSCode Extension v${{ needs.pre-publish-security.outputs.version }}"
+          echo "Installing AI Primitives Hub VSCode Extension v${{ needs.pre-publish-security.outputs.version }}"
 
           # Verify checksums
           if command -v sha256sum &> /dev/null; then
@@ -353,7 +340,7 @@ jobs:
           # Install extension
           if command -v code &> /dev/null; then
               echo "Installing extension using VS Code CLI..."
-              code --install-extension ${{env.EXTENSION_NAME}}-${{ needs.pre-publish-security.outputs.version }}.vsix
+              code --install-extension "${{env.EXTENSION_NAME}}-${{ needs.pre-publish-security.outputs.version }}.vsix"
               echo "Installation complete!"
           else
               echo "VS Code CLI not found. Please install the extension manually:"
@@ -367,7 +354,7 @@ jobs:
           # Create Windows installation script
           cat > installation-bundle/install.bat << 'INSTALL_BAT_EOF'
           @echo off
-          echo Installing Prompt Registry VSCode Extension v${{ needs.pre-publish-security.outputs.version }}
+          echo Installing AI Primitives Hub VSCode Extension v${{ needs.pre-publish-security.outputs.version }}
 
           where code >nul 2>nul
           if %ERRORLEVEL% == 0 (
@@ -389,16 +376,16 @@ jobs:
 
           # Create README
           cat > installation-bundle/README.md << 'README_EOF'
-          # Prompt Registry VSCode Extension Installation Bundle
+          # AI Primitives Hub VSCode Extension Installation Bundle
 
           ## Version: ${{ needs.pre-publish-security.outputs.version }}
 
-          This bundle contains the Prompt Registry VSCode Extension package and installation scripts.
+          This bundle contains the AI Primitives Hub VSCode Extension package and installation scripts.
 
           ### Security Information
 
           - **Package Integrity**: Verified with SHA256 checksums
-          - **SLSA Provenance**: Included for supply chain verification
+          - **SLSA Provenance**: Published separately when provenance generation succeeds
           - **Signed Release**: This package was built and signed using secure CI/CD practices
 
           ### Installation Options
@@ -433,7 +420,7 @@ jobs:
           ### Support
 
           For issues and support, please visit:
-          https://github.com/AmadeusITGroup/prompt-registry/issues
+          https://github.com/AmadeusITGroup/ai-primitives-hub/issues
           README_EOF
 
           # Create bundle archive
@@ -441,14 +428,14 @@ jobs:
 
       - name: Upload bundle to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{env.EXTENSION_NAME}}-vscode-extension-${{ needs.pre-publish-security.outputs.version }}-bundle.zip
           tag_name: ${{ github.event.release.tag_name }}
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: installation-bundle
           path: ${{env.EXTENSION_NAME}}-vscode-extension-${{ needs.pre-publish-security.outputs.version }}-bundle.zip
@@ -469,20 +456,22 @@ jobs:
     steps:
       - name: Generate security summary
         run: |
-          echo "## 🔒 Prompt Registry VSCode Extension - Secure Publish Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Version Published: ${{ needs.pre-publish-security.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "### Prerelease: ${{ needs.pre-publish-security.outputs.is_prerelease }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Security Compliance ✅" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ SLSA Level 3 provenance generated" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Package integrity verified with SHA256" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Vulnerability scanning completed" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Supply chain security validated" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Publication Status" >> $GITHUB_STEP_SUMMARY
-          echo "- VS Code Marketplace: ${{ needs.publish-marketplace.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Open VSX Registry: ${{ needs.publish-openvsx.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Installation Bundle: ${{ needs.create-bundles.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Package SHA256: ${{ needs.pre-publish-security.outputs.sha256 }}" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## 🔒 AI Primitives Hub VSCode Extension - Secure Publish Summary"
+            echo ""
+            echo "### Version Published: ${{ needs.pre-publish-security.outputs.version }}"
+            echo "### Prerelease: ${{ needs.pre-publish-security.outputs.is_prerelease }}"
+            echo ""
+            echo "### Security Compliance ✅"
+            echo "- ✅ SLSA Level 3 provenance generated"
+            echo "- ✅ Package integrity verified with SHA256"
+            echo "- ✅ Vulnerability scanning completed"
+            echo "- ✅ Supply chain security validated"
+            echo ""
+            echo "### Publication Status"
+            echo "- VS Code Marketplace: ${{ needs.publish-marketplace.result }}"
+            echo "- Open VSX Registry: ${{ needs.publish-openvsx.result }}"
+            echo "- Installation Bundle: ${{ needs.create-bundles.result }}"
+            echo ""
+            echo "### Package SHA256: ${{ needs.pre-publish-security.outputs.sha256 }}"
+          } >> "$GITHUB_STEP_SUMMARY"

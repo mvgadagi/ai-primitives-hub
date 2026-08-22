@@ -32,4 +32,12 @@ export abstract class BaseSourceAdapter implements SourceAdapter {
   public abstract validate(): Promise<ValidationResult>;
   public abstract getManifestUrl(bundleId: string, version?: string): string;
   public abstract getDownloadUrl(bundleId: string, version?: string): string;
+
+  /**
+   * Default: adapters that don't surface READMEs cannot download them.
+   * @param _bundle
+   */
+  public downloadReadme(_bundle: Bundle): Promise<string | null> {
+    return Promise.resolve(null);
+  }
 }

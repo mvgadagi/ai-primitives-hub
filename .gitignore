@@ -9,6 +9,7 @@ yarn-error.log
 .env.development.local
 .env.test.local
 .env.production.local
+.pnpm-store
 
 # IDE files
 .idea/
@@ -44,6 +45,9 @@ website/node_modules/
 
 # Generated skill references (copied from docs/ at build time)
 resources/skills/prompt-registry-helper/references
+
+# Generated schemas (copied from packages/core at build time)
+apps/vscode-extension/schemas/
 
 # Test outputs
 test-out/

@@ -1,0 +1,45 @@
+{
+  "name": "{{packageName}}",
+  "version": "1.0.0",
+  "description": "Prompt collection for GitHub Copilot",
+  "scripts": {
+    "validate": "ai-primitives-hub collection validate",
+    "validate:verbose": "ai-primitives-hub collection validate --verbose",
+    "build-collection-bundle": "ai-primitives-hub bundle build",
+    "publish-collections": "ai-primitives-hub bundle publish",
+    "list-collections": "ai-primitives-hub collection list",
+    "compute-collection-version": "ai-primitives-hub version compute",
+    "detect-affected-collections": "ai-primitives-hub collection affected",
+    "generate-manifest": "ai-primitives-hub bundle manifest",
+    "install-hooks": "git config core.hooksPath .githooks",
+    "skill:validate": "ai-primitives-hub skill validate",
+    "skill:create": "ai-primitives-hub skill create",
+    "build": "ai-primitives-hub bundle build",
+    "publish": "ai-primitives-hub bundle build"
+  },
+  "keywords": [
+    "copilot",
+    "instructions",
+    "agents",
+    "skills",
+    "ai",
+    "github-copilot",
+    "prompt-bundle"
+  ],
+  "author": "{{author}}",
+  "license": "SEE LICENSE IN LICENSE",
+  "files": [
+    "agents",
+    "collections",
+    "instructions",
+    "prompts",
+    "deployment-manifest.yml",
+    "*.zip"
+  ],
+  "devDependencies": {
+    "@ai-primitives-hub/cli": "^0.0.1-alpha.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -4,29 +4,43 @@ on:
   push:
     branches: [main, develop]
     paths:
-      - "src/**"
-      - "*.json"
-      - "*.js"
-      - "*.ts"
-      - ".github/workflows/**"
-      - "!lib/**"
+      - "apps/vscode-extension/**"
+      - "packages/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "package.json"
+      - "tsconfig.base.json"
+      - "eslint.shared.mjs"
+      - ".github/workflows/vscode-extension-secure-ci.yml"
+      - ".github/workflows/scripts/**"
+      - ".github/actions/npm-audit-pr-comment/**"
   pull_request:
     branches: [main, develop]
     paths:
-      - "src/**"
-      - "*.json"
-      - "*.js"
-      - "*.ts"
-      - ".github/workflows/**"
-      - "!lib/**"
+      - "apps/vscode-extension/**"
+      - "packages/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "package.json"
+      - "tsconfig.base.json"
+      - "eslint.shared.mjs"
+      - ".github/workflows/vscode-extension-secure-ci.yml"
+      - ".github/workflows/scripts/**"
+      - ".github/actions/npm-audit-pr-comment/**"
   workflow_dispatch:
 
 # Security: Restrict permissions to minimum necessary (SLSA Level 2)
 permissions: read-all
+
+# Cancel superseded pull-request runs while keeping every branch run distinct.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   # Security: Use environment variables for configuration
   NODE_VERSION: "24"
-  EXTENSION_DIR: "."
+  EXTENSION_DIR: "apps/vscode-extension"
   EXTENSION_NAME: "prompt-registry"
 
 jobs:
@@ -47,51 +61,48 @@ jobs:
           egress-policy: audit
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Security: Pin to specific commit for reproducibility
           # persist-credentials: false
           fetch-depth: 0
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: "npm"
-          cache-dependency-path: "${{ env.EXTENSION_DIR }}/package-lock.json"
-
-      - name: Build lib package
-        working-directory: lib
-        shell: bash
-        run: |
-          npm ci --fund=false
-          npm run build
+          cache: "pnpm"
+          cache-dependency-path: "pnpm-lock.yaml"
 
       - name: Install dependencies
-        working-directory: ${{ env.EXTENSION_DIR }}
         shell: bash
-        run: npm ci --fund=false
+        run: pnpm install --frozen-lockfile --prefer-offline
 
       - name: Report pre-existing vulnerabilities on PR
         if: github.event_name == 'pull_request'
         uses: ./.github/actions/npm-audit-pr-comment
         with:
-          working-directory: ${{ github.workspace }}
+          working-directory: ${{ github.workspace }}/${{ env.EXTENSION_DIR }}
           audit-flags: --omit=dev
           min-severity: moderate
           label: extension
 
       - name: Run Trivy vulnerability scanner
+        id: trivy_scan
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: "fs"
-          scan-ref: .
+          scan-ref: ${{ env.EXTENSION_DIR }}
           format: "sarif"
           output: "trivy-results.sarif"
-          skip-dirs: "website,lib"
+          skip-dirs: "node_modules"
+
       - name: Upload Trivy scan results to GitHub Security tab
+        if: ${{ steps.trivy_scan.outcome == 'success' }}
         uses: github/codeql-action/upload-sarif@v4
-        if: always()
         with:
           sarif_file: "trivy-results.sarif"
 
@@ -99,7 +110,6 @@ jobs:
   dependency-analysis:
     name: Dependency & License Analysis
     runs-on: ubuntu-latest
-    needs: security-scan
 
     steps:
       - name: Harden Runner
@@ -108,46 +118,42 @@ jobs:
           egress-policy: audit
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: "npm"
-          cache-dependency-path: "package-lock.json"
-
-      - name: Build lib package
-        working-directory: lib
-        run: |
-          npm ci --fund=false
-          npm run build
+          cache: "pnpm"
+          cache-dependency-path: "pnpm-lock.yaml"
 
       - name: Install dependencies
-        run: npm ci --fund=false
+        run: pnpm install --frozen-lockfile --prefer-offline
 
       - name: Generate SBOM (Software Bill of Materials)
-        run: |
-          npx @cyclonedx/cyclonedx-npm --output-file sbom.json
-          npx @cyclonedx/cyclonedx-npm --output-format xml --output-file sbom.xml
+        working-directory: ${{ env.EXTENSION_DIR }}
+        run: pnpm --filter prompt-registry sbom --sbom-format cyclonedx --sbom-type application --out sbom.json
 
       - name: License compliance check
+        working-directory: ${{ env.EXTENSION_DIR }}
         shell: bash
         run: |
-          npx license-checker --summary > license-summary.txt
-          npx license-checker --csv > license-report.csv
+          pnpm dlx license-checker --summary > license-summary.txt
+          pnpm dlx license-checker --csv > license-report.csv
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-reports
           path: |
-            sbom.json
-            sbom.xml
-            license-summary.txt
-            license-report.csv
+            ${{ env.EXTENSION_DIR }}/sbom.json
+            ${{ env.EXTENSION_DIR }}/license-summary.txt
+            ${{ env.EXTENSION_DIR }}/license-report.csv
 
   # Multi-platform validation
   # VSIX Packaging with Production Configuration:
@@ -158,7 +164,6 @@ jobs:
   validate:
     name: Validate Extension
     runs-on: ${{ matrix.os }}
-    needs: [security-scan, dependency-analysis]
 
     strategy:
       fail-fast: false
@@ -173,28 +178,36 @@ jobs:
           egress-policy: audit
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
-          cache: "npm"
-          cache-dependency-path: "package-lock.json"
+          cache: "pnpm"
+          cache-dependency-path: "pnpm-lock.yaml"
 
       - name: Install dependencies
-        run: npm ci --fund=false
+        run: pnpm install --frozen-lockfile --prefer-offline
 
-      - name: Build lib package
-        run: npm run compile-lib
+      # Builds packages (topological), lib, the GH action and the extension.
+      # The website is excluded: it has no workspace dependency and is covered by docs.yml.
+      # The extension's own `build` script is `compile`, so it is not compiled twice.
+      - name: Build workspace (excluding website)
+        run: pnpm --filter "!prompt-registry-docs" build
 
       - name: Run linting
-        run: npm run lint -- --quiet
+        run: pnpm --filter "!prompt-registry-docs" lint
 
-      - name: Run type checking
-        run: npm run compile
+      # Only core/infra/app/cli vitest suites. Must not be a recursive run:
+      # the extension's `test` script is `test:all` (unit + integration).
+      - name: Run packages unit tests
+        run: pnpm --filter "@ai-primitives-hub/*" test
 
       - name: Install VS Code dependencies (Linux)
         if: runner.os == 'Linux'
@@ -205,43 +218,30 @@ jobs:
 
       - name: Apply post-compilation fixes
         if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          # Ensure the post-compilation fixes script exists and is executable
-          # Create VS Code mock and apply fixes
-          if [ -f "./ensure-test-index.sh" ]; then
-            chmod +x ./ensure-test-index.sh
-            ./ensure-test-index.sh
-          fi
-          if [ -f "./create-vscode-mock.sh" ]; then
-            chmod +x ./create-vscode-mock.sh
-            ./create-vscode-mock.sh
-          fi
-          if [ -f "./post_compile_fixes.sh" ]; then
-            chmod +x ./post_compile_fixes.sh
-            ./post_compile_fixes.sh
-          fi
+        uses: ./.github/actions/post-compile-fixes
 
       - name: Compile tests
         shell: bash
-        run: npm run compile-tests
+        run: pnpm run compile-tests
 
       - name: Apply essential post-compilation fixes (all platforms)
         shell: bash
-        run: node .github/workflows/scripts/post-compile-fixes-essential.js
+        working-directory: ${{ env.EXTENSION_DIR }}
+        run: node ../../.github/workflows/scripts/post-compile-fixes-essential.js
 
       - name: Run unit tests
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
-            xvfb-run -a npm run test:unit
+            xvfb-run -a pnpm -C ${{ env.EXTENSION_DIR }} run test:unit
           else
-            npm run test:unit
+            pnpm -C ${{ env.EXTENSION_DIR }} run test:unit
           fi
 
       - name: Switch to production .vscodeignore for packaging
-        if: matrix.node-version == ${{ env.NODE_VERSION }}
+        if: ${{ matrix.node-version == env.NODE_VERSION }}
         shell: bash
+        working-directory: ${{ env.EXTENSION_DIR }}
         run: |
           echo "🔄 Switching to production .vscodeignore for VSIX packaging..."
           # Backup current .vscodeignore if it exists
@@ -260,12 +260,13 @@ jobs:
           fi
 
       - name: Package extension
-        if: matrix.node-version == ${{ env.NODE_VERSION }}
+        if: ${{ matrix.node-version == env.NODE_VERSION }}
         shell: bash
+        working-directory: ${{ env.EXTENSION_DIR }}
         run: |
           npm install -g @vscode/vsce
           echo "📦 Creating VSIX package with production .vscodeignore..."
-          vsce package --out ${{ env.EXTENSION_NAME }}-${{ matrix.os }}-${{ matrix.node-version }}.vsix
+          vsce package --no-dependencies --out ${{ env.EXTENSION_NAME }}-${{ matrix.os }}-${{ matrix.node-version }}.vsix
 
           # Show package size for verification
           if [ -f "${{env.EXTENSION_NAME}}-${{ matrix.os }}-${{ matrix.node-version }}.vsix" ]; then
@@ -274,8 +275,9 @@ jobs:
           fi
 
       - name: Restore original .vscodeignore after packaging
-        if: matrix.node-version == ${{ env.NODE_VERSION }}
+        if: ${{ matrix.node-version == env.NODE_VERSION }}
         shell: bash
+        working-directory: ${{ env.EXTENSION_DIR }}
         run: |
           # Restore the original .vscodeignore if backup exists
           if [ -f ".vscodeignore.ci-backup" ]; then
@@ -285,8 +287,9 @@ jobs:
           fi
 
       - name: Validate VSIX package
-        if: matrix.node-version == ${{ env.NODE_VERSION }}
+        if: ${{ matrix.node-version == env.NODE_VERSION }}
         shell: bash
+        working-directory: ${{ env.EXTENSION_DIR }}
         run: |
           # Extract and validate package contents
           unzip -l ${{env.EXTENSION_NAME}}-${{ matrix.os }}-${{ matrix.node-version }}.vsix
@@ -297,8 +300,8 @@ jobs:
           fi
 
       - name: Upload extension artifacts
-        if: matrix.node-version == ${{ env.NODE_VERSION }}
-        uses: actions/upload-artifact@v4
+        if: ${{ matrix.node-version == env.NODE_VERSION }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vsix-${{ matrix.os }}-node${{ matrix.node-version }}
           path: ${{ env.EXTENSION_DIR }}/*.vsix
@@ -323,31 +326,32 @@ jobs:
           egress-policy: audit
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: "npm"
-          cache-dependency-path: "package-lock.json"
-
-      - name: Build lib package
-        working-directory: lib
-        run: |
-          npm ci --fund=false
-          npm run build
+          cache: "pnpm"
+          cache-dependency-path: "pnpm-lock.yaml"
 
       - name: Install dependencies
-        run: npm ci --fund=false
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Build workspace packages
+        run: pnpm --filter "@ai-primitives-hub/*" --filter "@prompt-registry/collection-scripts" build
 
       - name: Compile extension and tests
+        working-directory: ${{ env.EXTENSION_DIR }}
         run: |
-          npm run compile
-          npm run compile-tests
-          node .github/workflows/scripts/post-compile-fixes-essential.js
+          pnpm run compile
+          pnpm run compile-tests
+          node ../../.github/workflows/scripts/post-compile-fixes-essential.js
 
       - name: Install VS Code and dependencies (Linux)
         if: runner.os == 'Linux'
@@ -357,32 +361,18 @@ jobs:
           sudo apt-get install -y libnss3-dev libatk-bridge2.0-dev libdrm2 libxkbcommon-dev libxss1 libasound2-dev
       - name: Apply post-compilation fixes
         if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          # Ensure the post-compilation fixes script exists and is executable
-          # Create VS Code mock and apply fixes
-          if [ -f "./.github/workflows/scripts/ensure-test-index.sh" ]; then
-            chmod +x ./.github/workflows/scripts/ensure-test-index.sh
-            ./.github/workflows/scripts/ensure-test-index.sh
-          fi
-          if [ -f "./.github/workflows/scripts/create-vscode-mock.sh" ]; then
-            chmod +x ./.github/workflows/scripts/create-vscode-mock.sh
-            ./.github/workflows/scripts/create-vscode-mock.sh
-          fi
-          if [ -f "./.github/workflows/scripts/post_compile_fixes.sh" ]; then
-            chmod +x ./.github/workflows/scripts/post_compile_fixes.sh
-            ./.github/workflows/scripts/post_compile_fixes.sh
-          fi
+        uses: ./.github/actions/post-compile-fixes
 
       - name: Run VS Code Extension Tests
         env:
           VSCODE_VERSION: ${{ matrix.vscode-version }}
         shell: bash
+        working-directory: ${{ env.EXTENSION_DIR }}
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
-            xvfb-run -a npm run test:integration
+            xvfb-run -a pnpm run test:integration
           else
-            npm run test:integration
+            pnpm run test:integration
           fi
 
   # Security compliance report
@@ -402,7 +392,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -434,7 +424,7 @@ jobs:
           echo "" >> compliance-report.md
 
       - name: Upload compliance report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: compliance-report
           path: compliance-report.md
@@ -467,7 +457,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Testing & Validation ✅" >> $GITHUB_STEP_SUMMARY
           echo "- Multi-platform testing (Linux, Windows, macOS)" >> $GITHUB_STEP_SUMMARY
-          echo "- Multi-version Node.js testing (18, 20)" >> $GITHUB_STEP_SUMMARY
+          echo "- Node.js validation (version 24)" >> $GITHUB_STEP_SUMMARY
           echo "- VS Code integration testing" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Artifacts Generated 📦" >> $GITHUB_STEP_SUMMARY

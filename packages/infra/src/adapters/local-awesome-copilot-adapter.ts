@@ -48,6 +48,7 @@ import {
 import {
   isValidLocalUrl,
   resolveLocalPath,
+  toFileUrl,
 } from './local-path';
 
 const DEFAULT_COLLECTIONS_PATH = 'collections';
@@ -67,6 +68,9 @@ interface CollectionManifest {
   version?: string;
   author?: string;
   tags?: string[];
+  readme?: {
+    path?: string;
+  };
   items: CollectionItem[];
   mcpServers?: Record<string, unknown>;
   mcp?: {
@@ -200,8 +204,15 @@ export class LocalAwesomeCopilotAdapter extends BaseSourceAdapter {
     return yaml.load(content) as CollectionManifest;
   }
 
-  private buildBundle(collection: CollectionManifest, collectionFile: string, mtimeMs: number): Bundle {
+  private buildBundle(
+    collection: CollectionManifest,
+    collectionFile: string,
+    mtimeMs: number
+  ): Bundle {
     const collectionPath = path.join(this.getCollectionsDir(), collectionFile);
+    const readmePath = collection.readme?.path
+      ? path.join(this.getLocalPath(), collection.readme.path)
+      : undefined;
     const bundle: Bundle = {
       id: collection.id,
       name: collection.name,
@@ -212,12 +223,13 @@ export class LocalAwesomeCopilotAdapter extends BaseSourceAdapter {
       repository: this.source.url,
       tags: collection.tags ?? [],
       environments: inferEnvironments(collection.tags ?? []),
-      manifestUrl: `file://${collectionPath}`,
-      downloadUrl: `file://${collectionPath}`,
+      manifestUrl: toFileUrl(collectionPath),
+      downloadUrl: toFileUrl(collectionPath),
       lastUpdated: new Date(mtimeMs).toISOString(),
       size: `${collection.items.length} items`,
       dependencies: [],
-      license: 'MIT'
+      license: 'MIT',
+      readmeUrl: readmePath ? toFileUrl(readmePath) : undefined
     };
 
     // Attach a content breakdown + raw MCP servers for the Marketplace
@@ -232,6 +244,16 @@ export class LocalAwesomeCopilotAdapter extends BaseSourceAdapter {
     return bundle;
   }
 
+  /**
+   * Absolute path of the README a local collection declares, if any.
+   * Single source of truth for both `readmeUrl` and `readmeRevision`, so the
+   * two can never describe different files. Rejects declarations that
+   * escape the configured source root (e.g. `../outside.md`) - the local
+   * adapter reads manifests directly, so core's schema validation never
+   * sees this path.
+   * @param collection Parsed local collection manifest.
+   * @returns Absolute README path, or undefined when none is declared or unsafe.
+   */
   private createDeploymentManifest(collection: CollectionManifest): Record<string, unknown> {
     const prompts = collection.items.map((item) => {
       if (item.kind === 'skill') {
@@ -248,7 +270,7 @@ export class LocalAwesomeCopilotAdapter extends BaseSourceAdapter {
       }
 
       const filename = item.path.split('/').pop() ?? 'unknown';
-      const id = filename.replace(/\.(prompt|instructions|chatmode|agent)\.md$/, '');
+      const id = filename.replace(/\.(prompt|instructions|chatmode|agent)\.md$/, '').replace(/\.md$/, '');
       return {
         id,
         name: titleCase(id.replace(/-/g, ' ')),
@@ -359,6 +381,18 @@ export class LocalAwesomeCopilotAdapter extends BaseSourceAdapter {
     }
   }
 
+  public async downloadReadme(bundle: Bundle): Promise<string | null> {
+    if (!bundle.readmeUrl) {
+      return null;
+    }
+    const localFile = resolveLocalPath(bundle.readmeUrl);
+    try {
+      return await this.fs.readFile(localFile);
+    } catch {
+      return null;
+    }
+  }
+
   public async fetchMetadata(): Promise<SourceMetadata> {
     try {
       const localPath = this.getLocalPath();
@@ -377,7 +411,7 @@ export class LocalAwesomeCopilotAdapter extends BaseSourceAdapter {
   }
 
   public getManifestUrl(bundleId: string): string {
-    return `file://${path.join(this.getCollectionsDir(), `${bundleId}.collection.yml`)}`;
+    return toFileUrl(path.join(this.getCollectionsDir(), `${bundleId}.collection.yml`));
   }
 
   public getDownloadUrl(bundleId: string): string {

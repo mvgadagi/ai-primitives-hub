@@ -108,7 +108,7 @@ describe("resolveLink", () => {
       const result = resolveLink("CONTRIBUTING.md", "/prompt-registry/", BASE_URL);
       expect(result).toEqual({
         type: "external",
-        href: "https://github.com/AmadeusITGroup/prompt-registry/blob/main/CONTRIBUTING.md",
+        href: "https://github.com/AmadeusITGroup/ai-primitives-hub/blob/main/CONTRIBUTING.md",
       });
     });
 
@@ -116,7 +116,7 @@ describe("resolveLink", () => {
       const result = resolveLink("package.json", "/prompt-registry/", BASE_URL);
       expect(result).toEqual({
         type: "external",
-        href: "https://github.com/AmadeusITGroup/prompt-registry/blob/main/package.json",
+        href: "https://github.com/AmadeusITGroup/ai-primitives-hub/blob/main/package.json",
       });
     });
 
@@ -124,7 +124,7 @@ describe("resolveLink", () => {
       const result = resolveLink("schemas/collection.schema.json", "/prompt-registry/", BASE_URL);
       expect(result).toEqual({
         type: "external",
-        href: "https://github.com/AmadeusITGroup/prompt-registry/blob/main/schemas/collection.schema.json",
+        href: "https://github.com/AmadeusITGroup/ai-primitives-hub/blob/main/schemas/collection.schema.json",
       });
     });
 
@@ -132,7 +132,7 @@ describe("resolveLink", () => {
       const result = resolveLink("config.yaml", "/prompt-registry/", BASE_URL);
       expect(result).toEqual({
         type: "external",
-        href: "https://github.com/AmadeusITGroup/prompt-registry/blob/main/config.yaml",
+        href: "https://github.com/AmadeusITGroup/ai-primitives-hub/blob/main/config.yaml",
       });
     });
 
@@ -140,7 +140,7 @@ describe("resolveLink", () => {
       const result = resolveLink("CONTRIBUTING.md#setup", "/prompt-registry/", BASE_URL);
       expect(result).toEqual({
         type: "external",
-        href: "https://github.com/AmadeusITGroup/prompt-registry/blob/main/CONTRIBUTING.md#setup",
+        href: "https://github.com/AmadeusITGroup/ai-primitives-hub/blob/main/CONTRIBUTING.md#setup",
       });
     });
   });
@@ -167,7 +167,7 @@ describe("stripMarkdownExtension", () => {
 describe("toRepoUrl", () => {
   it("creates a GitHub blob URL", () => {
     expect(toRepoUrl("CONTRIBUTING.md")).toBe(
-      "https://github.com/AmadeusITGroup/prompt-registry/blob/main/CONTRIBUTING.md",
+      "https://github.com/AmadeusITGroup/ai-primitives-hub/blob/main/CONTRIBUTING.md",
     );
   });
 });

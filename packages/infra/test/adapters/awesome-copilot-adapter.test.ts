@@ -234,11 +234,11 @@ describe('AwesomeCopilotAdapter', () => {
       const adapter = new AwesomeCopilotAdapter(makeSource(), recordingApi, clock);
       await adapter.fetchBundles();
       await adapter.fetchBundles();
-      expect(recordingApi.countOf('getJson')).toBe(1);
+      expect(recordingApi.countOf('getJson')).toBe(2);
 
       clock.advance(5 * 60 * 1000 + 1);
       await adapter.fetchBundles();
-      expect(recordingApi.countOf('getJson')).toBe(2);
+      expect(recordingApi.countOf('getJson')).toBe(4);
     });
 
     it('clearCache forces a re-fetch on the next call even within the TTL', async () => {
@@ -249,11 +249,11 @@ describe('AwesomeCopilotAdapter', () => {
 
       const adapter = new AwesomeCopilotAdapter(makeSource(), recordingApi, new FixedClock(0));
       await adapter.fetchBundles();
-      expect(recordingApi.countOf('getJson')).toBe(1);
+      expect(recordingApi.countOf('getJson')).toBe(2);
 
       adapter.clearCache();
       await adapter.fetchBundles();
-      expect(recordingApi.countOf('getJson')).toBe(2);
+      expect(recordingApi.countOf('getJson')).toBe(4);
     });
 
     it('wraps a collection-listing failure with a descriptive error', async () => {

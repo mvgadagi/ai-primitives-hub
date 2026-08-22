@@ -35,6 +35,16 @@ describe('determineFileType', () => {
     expect(determineFileType('foo.agent.md')).toBe('agent');
   });
 
+  it('detects any .md file in an agents/ directory as an agent', () => {
+    expect(determineFileType('agents/reviewer.md')).toBe('agent');
+    expect(determineFileType('path/to/agents/my-agent.md')).toBe('agent');
+  });
+
+  it('does not treat .md files outside agents/ as agents', () => {
+    expect(determineFileType('prompts/my-agent.md')).toBe('prompt');
+    expect(determineFileType('instructions/my-agent.md')).toBe('prompt');
+  });
+
   it('is case-insensitive on extension', () => {
     expect(determineFileType('FOO.PROMPT.MD')).toBe('prompt');
   });

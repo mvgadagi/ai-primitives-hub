@@ -68,6 +68,9 @@ interface CollectionManifest {
   version?: string;
   author?: string;
   tags?: string[];
+  readme?: {
+    path?: string;
+  };
   items: CollectionItem[];
   mcpServers?: Record<string, unknown>;
   mcp?: {
@@ -198,6 +201,16 @@ export class AwesomeCopilotAdapter extends BaseSourceAdapter {
     return `https://raw.githubusercontent.com/${owner}/${repo}/${this.branch}/${path}`;
   }
 
+  private async getBranchHeadSha(): Promise<string> {
+    const { owner, repo } = this.parseGitHubUrl();
+    try {
+      const commit = await this.githubApi.getJson<{ sha: string }>(`/repos/${owner}/${repo}/commits/${this.branch}`);
+      return commit.sha;
+    } catch {
+      return this.branch;
+    }
+  }
+
   private async listCollectionFiles(): Promise<string[]> {
     const entries = await this.githubApi.getJson<GitHubContentEntry[]>(this.buildApiPath(this.collectionsPath));
     return entries.filter((entry) => entry.type === 'file' && entry.name.endsWith('.collection.yml')).map((entry) => entry.name);
@@ -233,9 +246,12 @@ export class AwesomeCopilotAdapter extends BaseSourceAdapter {
     return yaml.load(yamlContent) as CollectionManifest;
   }
 
-  private buildBundle(collection: CollectionManifest, collectionFile: string): Bundle {
+  private buildBundle(collection: CollectionManifest, collectionFile: string, readmeRevision: string): Bundle {
     const { owner } = this.parseGitHubUrl();
     const rawUrl = this.buildRawUrl(`${this.collectionsPath}/${collectionFile}`);
+    const readmeUrl = collection.readme?.path
+      ? this.buildRawUrl(collection.readme.path)
+      : undefined;
     const bundle: Bundle = {
       id: collection.id,
       name: collection.name,
@@ -251,7 +267,9 @@ export class AwesomeCopilotAdapter extends BaseSourceAdapter {
       lastUpdated: this.clock.nowIso(),
       size: `${collection.items.length} items`,
       dependencies: [],
-      license: 'MIT'
+      license: 'MIT',
+      readmeUrl,
+      readmeRevision
     };
 
     // Attach a content breakdown + raw MCP servers for the Marketplace
@@ -282,7 +300,7 @@ export class AwesomeCopilotAdapter extends BaseSourceAdapter {
       }
 
       const filename = item.path.split('/').pop() ?? 'unknown';
-      const id = filename.replace(/\.(prompt|instructions|chatmode|agent)\.md$/, '');
+      const id = filename.replace(/\.(prompt|instructions|chatmode|agent)\.md$/, '').replace(/\.md$/, '');
       return {
         id,
         name: titleCase(id.replace(/-/g, ' ')),
@@ -355,10 +373,11 @@ export class AwesomeCopilotAdapter extends BaseSourceAdapter {
     }
 
     const bundles: Bundle[] = [];
+    const readmeRevision = await this.getBranchHeadSha();
     for (let i = 0; i < collectionFiles.length; i += COLLECTION_FETCH_CONCURRENCY) {
       const batch = collectionFiles.slice(i, i + COLLECTION_FETCH_CONCURRENCY);
       const results = await Promise.allSettled(
-        batch.map(async (collectionFile) => this.buildBundle(await this.fetchCollection(collectionFile), collectionFile))
+        batch.map(async (collectionFile) => this.buildBundle(await this.fetchCollection(collectionFile), collectionFile, readmeRevision))
       );
       for (const result of results) {
         if (result.status === 'fulfilled') {
@@ -381,6 +400,17 @@ export class AwesomeCopilotAdapter extends BaseSourceAdapter {
       return await this.createBundleArchive(collection);
     } catch (error) {
       throw new Error(`Failed to download bundle: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+
+  public async downloadReadme(bundle: Bundle): Promise<string | null> {
+    if (!bundle.readmeUrl) {
+      return null;
+    }
+    try {
+      return await this.githubApi.getText(bundle.readmeUrl);
+    } catch {
+      return null;
     }
   }
 

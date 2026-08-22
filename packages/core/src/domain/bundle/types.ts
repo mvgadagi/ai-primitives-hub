@@ -43,6 +43,12 @@ export interface Bundle {
     algorithm: string;
     hash: string;
   };
+  /** URL to the README asset (if available). */
+  readmeUrl?: string;
+  /** Cached README text content. */
+  readme?: string;
+  /** Source revision the cached readme corresponds to (e.g. release tag, commit sha). */
+  readmeRevision?: string;
 }
 
 /**
@@ -79,6 +85,17 @@ export interface BundleRef {
   bundleId: string;
   bundleVersion: string;
   installed: boolean;
+}
+
+/**
+ * Stable identity for one source-qualified bundle version.
+ *
+ * The separator is intentionally not user-facing; callers should treat the
+ * result as an opaque key shared by index records and installation snapshots.
+ * @param ref
+ */
+export function getBundleRefKey(ref: Pick<BundleRef, 'sourceId' | 'bundleId' | 'bundleVersion'>): string {
+  return `${ref.sourceId}\u0000${ref.bundleId}\u0000${ref.bundleVersion}`;
 }
 
 /**

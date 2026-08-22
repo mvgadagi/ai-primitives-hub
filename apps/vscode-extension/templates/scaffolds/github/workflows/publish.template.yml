@@ -1,0 +1,149 @@
+name: Publish Package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  publish-collections:
+    name: Publish Collection Releases
+    runs-on: {{githubRunner}}
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
+      packages: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Common setup
+        id: setup
+        uses: ./.github/actions/publish-common
+
+      - name: Fail if validation failed
+        if: steps.setup.outputs.validation-status == 'failure'
+        run: exit 1
+
+      - name: Publish affected collections
+        # NOTE: github.event.before may be all zeros (0000000...) on the first push to a
+        # branch or after a force-push. We treat an all-zero base as an initial commit
+        # and skip affected-file detection.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_BASE_SHA: ${{ github.event.before }}
+          GITHUB_HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "Initial push detected; no affected collections to publish."
+            exit 0
+          fi
+
+          changed_paths=$(git diff --name-only "$GITHUB_BASE_SHA" "$GITHUB_HEAD_SHA" || true)
+          if [ -z "$changed_paths" ]; then
+            echo "No changed paths detected."
+            exit 0
+          fi
+
+          affected_files=$(npx ai-primitives-hub collection affected -o json $(printf ' --changed-path %s' $changed_paths) | jq -r '.data.affected[].file')
+          if [ -z "$affected_files" ]; then
+            echo "No affected collections."
+            exit 0
+          fi
+
+          for file in $affected_files; do
+            collection_id=$(basename "$file" .collection.yml)
+            version_data=$(npx ai-primitives-hub version compute --collection-file "$file" -o json)
+            version=$(echo "$version_data" | jq -r '.data.nextVersion')
+            tag=$(echo "$version_data" | jq -r '.data.tag')
+
+            echo "Publishing $collection_id @ $version (tag: $tag)"
+            bundle_data=$(npx ai-primitives-hub bundle build --collection-file "$file" --version "$version" --out-dir "dist" -o json)
+            assets=()
+            # Bash 3.2 (default on macOS runners) lacks mapfile/readarray, so
+            # build the array with a portable read loop instead.
+            while IFS= read -r asset; do
+              assets+=("$asset")
+            done < <(echo "$bundle_data" | jq -r '[.data.zipAsset, .data.manifestAsset, .data.readmeAsset] | map(select(. != null)) | .[]')
+
+            gh release create "$tag" \
+              --title "$collection_id $version" \
+              --notes "Release $tag" \
+              "${assets[@]}"
+          done
+
+  publish-preview:
+    name: Preview Collection Releases (PR)
+    runs-on: {{githubRunner}}
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Save PR number
+        run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+
+      - name: Common setup
+        id: setup
+        uses: ./.github/actions/publish-common
+
+      - name: Post validation results to PR
+        uses: ./.github/actions/pr-comment
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: validation-comment.md
+          comment-tag: collection-validation
+
+      - name: Fail if validation failed
+        if: steps.setup.outputs.validation-status == 'failure'
+        run: exit 1
+
+      - name: Preview affected collections
+        env:
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          changed_paths=$(git diff --name-only "$GITHUB_BASE_SHA" "$GITHUB_HEAD_SHA" || true)
+          if [ -z "$changed_paths" ]; then
+            echo "No changed paths detected."
+            exit 0
+          fi
+
+          affected_files=$(npx ai-primitives-hub collection affected -o json $(printf ' --changed-path %s' $changed_paths) | jq -r '.data.affected[].file')
+          if [ -z "$affected_files" ]; then
+            echo "No affected collections."
+            exit 0
+          fi
+
+          for file in $affected_files; do
+            collection_id=$(basename "$file" .collection.yml)
+            version=$(npx ai-primitives-hub version compute --collection-file "$file" -o json | jq -r '.data.nextVersion')
+            echo "Previewing $collection_id @ $version"
+            npx ai-primitives-hub bundle build --collection-file "$file" --version "$version" --out-dir "dist"
+          done
+
+      - name: Upload preview artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr-preview-dist
+          path: |
+            dist/
+          if-no-files-found: ignore

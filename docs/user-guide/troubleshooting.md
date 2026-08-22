@@ -33,6 +33,13 @@ View logs: `View → Output → AI Primitives Hub`
 4. Run: `AI Primitives Hub: Validate Repository Access`
 5. Force refresh authentication: `AI Primitives Hub: Force GitHub Authentication`
 
+### Azure DevOps Authentication Fails (401/403)
+
+1. Verify the PAT was entered correctly when adding the source
+2. Ensure the PAT has **Code (Read)** permission for the target repository
+3. Check the PAT has not expired (Azure DevOps → User Settings → Personal Access Tokens)
+4. Re-add the source with a fresh PAT via `AI Primitives Hub: Add Source`
+
 ### Source Connection Failed
 
 - Verify repository URL
@@ -58,7 +65,8 @@ If you installed the extension but were never prompted to select a hub:
 
 ## Useful Commands
 
-Access these commands via Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`):
+Open the Command Palette (`Ctrl+Shift+P` on Windows/Linux or `Cmd+Shift+P` on
+macOS) to access these commands:
 
 ### Diagnostic Commands
 - `AI Primitives Hub: Validate Repository Access` - Test GitHub connectivity and permissions
