@@ -215,6 +215,46 @@ items:
       const envelope = parseJson<{ ok: boolean }>(result.stdout);
       expect(envelope.data.ok).toBe(false);
     });
+
+    describe('plugin items', () => {
+      const writePluginCollection = async (name: string, manifest: Record<string, unknown>): Promise<string> => {
+        await mkdir(path.join(workspace, 'plugins', name), { recursive: true });
+        await writeFile(
+          path.join(workspace, 'plugins', name, 'plugin.json'),
+          JSON.stringify({ $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json', name, ...manifest })
+        );
+        await writeFile(path.join(workspace, 'README.md'), '# Plug\n');
+        const collectionFile = `collections/${name}.collection.yml`;
+        await writeFile(
+          path.join(workspace, collectionFile),
+          `id: ${name}\nname: ${name}\nreadme:\n  path: README.md\nitems:\n  - path: plugins/${name}/plugin.json\n    kind: plugin\n`
+        );
+        return collectionFile;
+      };
+
+      it('fails when a plugin manifest violates Agent Plugins 1.0.0', async () => {
+        const collectionFile = await writePluginCollection('bad-author', { author: 'someone' });
+        const result = await run(['collection', 'validate', '--collection-file', collectionFile, '-o', 'json']);
+        expect(result.exitCode).toBe(1);
+        const envelope = parseJson<{ ok: boolean; errors: string[] }>(result.stdout);
+        expect(envelope.data.ok).toBe(false);
+        expect(envelope.data.errors).toEqual([
+          expect.stringContaining('items[0] plugin plugins/bad-author/plugin.json: "author" must be an object')
+        ]);
+      });
+
+      it('passes with a warning for an unknown plugin manifest field', async () => {
+        const collectionFile = await writePluginCollection('extra-field', { hooks: 'hooks.json' });
+        const result = await run(['collection', 'validate', '--collection-file', collectionFile, '-o', 'json']);
+        expect(result.exitCode).toBe(0);
+        const envelope = parseJson<{ ok: boolean }>(result.stdout);
+        expect(envelope.data.ok).toBe(true);
+        expect(envelope.status).toBe('warning');
+        expect(envelope.warnings).toEqual([
+          expect.stringContaining('items[0] plugin plugins/extra-field/plugin.json: unknown top-level field "hooks"')
+        ]);
+      });
+    });
   });
 
   describe('collection affected', () => {
@@ -438,6 +478,47 @@ mcp:
       expect(cliManifest).toEqual(legacyManifest);
     });
 
+    it('preserves ${env:VAR} and ${env:VAR:-default} placeholders in MCP headers verbatim', async () => {
+      await writeFile(
+        path.join(workspace, 'collections', 'foo.collection.yml'),
+        `id: foo
+name: Foo Collection
+description: Test collection
+items:
+  - path: prompts/hello.prompt.md
+    kind: prompt
+mcp:
+  items:
+    gateway:
+      type: http
+      url: https://gateway.example.test/mcp
+      headers:
+        x-jira-token: "Token \${env:JIRA_PAT:-}"
+        x-sonar-token: "Token \${env:SONARQUBE_TOKEN}"
+        x-user: \${env:APROACH_USERNAME:-anonymous}
+`
+      );
+
+      const outFile = path.join(workspace, 'manifest.yml');
+      const result = await run([
+        'bundle', 'manifest',
+        '--version', '1.0.0',
+        '--collection-file', 'collections/foo.collection.yml',
+        '--out-file', outFile,
+        '-o', 'json'
+      ]);
+      expect(result.exitCode).toBe(0);
+
+      const manifest = yaml.load(await readFile(outFile, 'utf8')) as {
+        mcpServers: Record<string, { headers: Record<string, string> }>;
+      };
+      expect(manifest.mcpServers.gateway.headers).toEqual({
+        'x-jira-token': 'Token ${env:JIRA_PAT:-}',
+        'x-sonar-token': 'Token ${env:SONARQUBE_TOKEN}',
+        'x-user': '${env:APROACH_USERNAME:-anonymous}'
+      });
+    });
+
     it('records the declared README basename and matches the legacy generator', async () => {
       await mkdir(path.join(workspace, 'docs'), { recursive: true });
       await writeFile(path.join(workspace, 'docs', 'collection-overview.md'), '# Overview\n');
@@ -502,7 +583,8 @@ items:
     });
   });
 
-  describe('bundle build', () => {
+  // Real Git subprocesses and archive IO need more than five seconds on Windows CI.
+  describe('bundle build', { timeout: 30_000 }, () => {
     it('builds a self-contained governed archive and retains metadata outside target content', async () => {
       await mkdir(path.join(workspace, 'docs'), { recursive: true });
       await writeFile(path.join(workspace, 'docs', 'collection-overview.md'), '# Overview\n');
@@ -642,6 +724,38 @@ items:
       expect(await readFile(path.join(workspace, envelope.data.readmeAsset!), 'utf8')).toBe('# Overview\n');
       const manifest = yaml.load(await readFile(path.join(workspace, 'dist', 'foo', 'deployment-manifest.yml'), 'utf8')) as { readme: string };
       expect(manifest.readme).toBe('README.md');
+    });
+
+    it('derives the bundle id from --repo-slug, collection id, and version', async () => {
+      const result = await run([
+        'bundle', 'build', '--version', '1.0.0', '--repo-slug', 'owner/repo', '-o', 'json'
+      ]);
+      expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0);
+      expect(parseJson<{ bundleId: string }>(result.stdout).data.bundleId).toBe('owner-repo-foo-v1.0.0');
+    });
+
+    it('fails with exit 1 on a planning error other than missing license evidence', async () => {
+      await writeFile(
+        path.join(workspace, 'collections', 'foo.collection.yml'),
+        `id: foo
+name: Foo Collection
+items:
+  - path: prompts/hello.prompt.md
+    kind: unknown-kind
+`
+      );
+      commitFixtureChanges();
+
+      const result = await run([
+        'bundle', 'build', '--version', '1.0.0', '-o', 'json'
+      ]);
+      expect(result.exitCode).toBe(1);
+      const envelope = JSON.parse(result.stdout) as { status: string; errors: { code: string; message: string }[] };
+      expect(envelope.status).toBe('error');
+      expect(envelope.errors[0]).toMatchObject({
+        code: 'INTERNAL.UNEXPECTED',
+        message: 'Collection item kind is not a canonical primitive kind: unknown-kind'
+      });
     });
 
     it('defaults to the first collection file under collections/ when --collection-file is omitted', async () => {
