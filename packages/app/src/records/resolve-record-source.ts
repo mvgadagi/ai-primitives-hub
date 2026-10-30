@@ -41,10 +41,11 @@ const CONFIGURED_FIELDS = ['branch', 'collectionsPath', 'indexFile', 'authMode',
 const RECORD_FIELDS = ['branch', 'collectionsPath', 'indexFile'] as const;
 
 /**
- * Whether a source type reads a folder on disk, kept in its `url`.
+ * Whether a source type reads a folder on disk, kept in its `url`: `local`
+ * and every `local-*` type (for example `local-skills`).
  * @param type - Source type.
  */
-const isLocalType = (type: string): boolean => type === 'local' || type.startsWith('local-');
+export const isLocalType = (type: string): boolean => type === 'local' || type.startsWith('local-');
 
 const isInside = (realRoot: string, candidate: string): boolean => {
   const relative = path.relative(realRoot, candidate);
@@ -107,6 +108,19 @@ const confineLocalFolder = async (fs: RecordFs, root: string, recordedPath: stri
 };
 
 /**
+ * Whether a `local` source folder stays inside the repository root once every
+ * symlink is resolved (NFR4.14). A relative path is taken from the root; a
+ * symlink inside the root that points outside it counts as outside, and a
+ * folder that does not resolve is not inside.
+ * @param fs - Filesystem port.
+ * @param root - Repository root.
+ * @param localPath - The source's folder, relative to the root or absolute.
+ * @returns `true` only when the realpath of the folder is the realpath'd root or below it.
+ */
+export const isLocalSourceInsideRoot = async (fs: RecordFs, root: string, localPath: string): Promise<boolean> =>
+  (await confineLocalFolder(fs, root, localPath)) !== undefined;
+
+/**
  * Decide which source an entry is replayed or updated from (NFR4.11).
  * @param sourceId - The entry's `sourceId`.
  * @param fromRecord - The record's copy of that source.
@@ -129,6 +143,7 @@ export const resolveRecordSource = async (
   if (!isLocalType(fromRecord.type)) {
     return { use: fromRecordCopy(sourceId, fromRecord, fromRecord.url) };
   }
+  // Same check as `isLocalSourceInsideRoot`, keeping the realpath it resolved.
   const folder = await confineLocalFolder(fs, root, fromRecord.url);
   return folder === undefined
     ? { skip: LOCAL_SOURCE_OUTSIDE_REASON }

@@ -4,11 +4,10 @@
  *
  * Reads the 3.0.0 repository records (`ai-primitives-hub.lock.json` and
  * `ai-primitives-hub.local.lock.json`, at the git root) through the shared
- * `RecordStore`, and merges them with the prompt-registry lockfiles read by
- * `LockfileManager`: for a bundle id present in a new file, the new item wins
- * and the old one is dropped. Only the listing port of
- * `RegistryManager.listInstalledBundles` uses this; `LockfileManager` and its
- * other callers are unchanged in U1.
+ * `RecordStore`, and merges them with the old prompt-registry lockfiles
+ * (read through app's `json-lockfile-store` by the record adapter): for a
+ * bundle id present in a new file, the new item wins and the old one is
+ * dropped. `RegistryManager.listInstalledBundles` uses this.
  *
  * A bundle whose tools are split across the two new files (BR3.6) is one
  * item, built from its latest entry in either file. Problems (a `RECORD.*`
@@ -19,6 +18,7 @@
  */
 import * as path from 'node:path';
 import {
+  type LockfileBundleEntry,
   RecordStore,
 } from '@ai-primitives-hub/app';
 import {
@@ -36,9 +36,6 @@ import {
 } from '@ai-primitives-hub/infra';
 import * as vscode from 'vscode';
 import type {
-  LockfileBundleEntry,
-} from '../types/lockfile';
-import type {
   InstalledBundle,
 } from '../types/registry';
 import {
@@ -46,17 +43,20 @@ import {
 } from '../utils/logger';
 import {
   createInstalledBundleFromLockfile,
-} from './lockfile-manager';
+} from './installed-bundle-from-entry';
+
+/** Marketplace id of this extension (`<publisher>.<name>`, ADR-0004: unchanged). */
+export const EXTENSION_ID = 'AmadeusITGroup.prompt-registry';
 
 /**
  * Writer stamp for records the extension writes (`generatedBy`), from the
- * same version source `LockfileManager` uses.
+ * running extension's `package.json` version.
  * @returns `ai-primitives-hub-extension@<version>`.
  */
 export const getExtensionRecordGeneratedBy = (): string => {
   let extensionVersion = '0.0.0';
   try {
-    const extension = vscode.extensions.getExtension('prompt-registry');
+    const extension = vscode.extensions.getExtension(EXTENSION_ID);
     if (extension) {
       const { version } = extension.packageJSON as { version?: string };
       extensionVersion = version || '0.0.0';
@@ -183,7 +183,7 @@ export class InstallRecordListing {
    * @param entry - The bundle's latest tool entry.
    */
   private async addItem(items: Map<string, InstalledBundle>, location: RecordLocation, bundleId: string, entry: ToolEntry): Promise<void> {
-    // Same minimal manifest and `.github` install path LockfileManager uses:
+    // Minimal manifest and a `.github` install path:
     // never the git root, which the extension's uninstall would delete recursively.
     const asLockfileEntry: LockfileBundleEntry = {
       version: entry.version,
@@ -213,7 +213,7 @@ export class InstallRecordListing {
           return true;
         }
       } catch (error) {
-        // Same policy as LockfileManager: on an I/O error other than "missing", assume the file exists.
+        // On an I/O error other than "missing", assume the file exists.
         this.logger.warn(`Failed to check file existence for ${file.path}:`, error instanceof Error ? error : undefined);
       }
     }
@@ -277,7 +277,7 @@ export class InstallRecordListing {
   /**
    * List repository bundles: new records first, then old lockfile items whose id no new file has (BR5.1).
    * @param workspaceRoot - Workspace root the git-root walk starts from.
-   * @param legacy - Reads the prompt-registry lockfiles (`LockfileManager.getInstalledBundles`).
+   * @param legacy - Reads the old prompt-registry lockfiles (`ExtensionRecordAdapter.listOldBundles`).
    * @returns One item per bundle id.
    */
   public async listRepositoryBundles(
@@ -302,10 +302,27 @@ export class InstallRecordListing {
  * @param onChange - Refreshes the listing.
  * @returns The watcher's disposable.
  */
-export const watchInstallRecords = (root: string, onChange: () => void): vscode.Disposable => {
-  const watcher = vscode.workspace.createFileSystemWatcher(
-    new vscode.RelativePattern(root, `{${RECORD_FILE_NAMES.join(',')}}`)
-  );
+export const watchInstallRecords = (root: string, onChange: () => void): vscode.Disposable =>
+  watchFiles(root, `{${RECORD_FILE_NAMES.join(',')}}`, onChange);
+
+/**
+ * Watch the old `prompt-registry*.lock.json` files of a workspace folder and
+ * call `onChange` on create, change or delete.
+ * @param workspaceFolder - Folder the old files live in.
+ * @param onChange - Refreshes the listing.
+ * @returns The watcher's disposable.
+ */
+export const watchOldLockfiles = (workspaceFolder: string, onChange: () => void): vscode.Disposable =>
+  watchFiles(workspaceFolder, 'prompt-registry*.lock.json', onChange);
+
+/**
+ * One file watcher calling `onChange` on create, change or delete.
+ * @param base - Folder the pattern is relative to.
+ * @param pattern - Glob pattern.
+ * @param onChange - Change callback.
+ */
+const watchFiles = (base: string, pattern: string, onChange: () => void): vscode.Disposable => {
+  const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(base, pattern));
   const subscriptions = [watcher.onDidCreate(onChange), watcher.onDidChange(onChange), watcher.onDidDelete(onChange)];
   return {
     dispose: () => {

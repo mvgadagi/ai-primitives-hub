@@ -12,9 +12,11 @@
  * nothing: the superseded files come back in `RecordChange.deletedFiles`, and
  * the caller passes the change to `deleteSuperseded` after the save (BR3.4).
  * `listEntries` gives the `status` rows (BR9.2) and `holdingLocation` the file
- * an entry is re-recorded in (BR6.5).
+ * an entry is re-recorded in (BR6.5). `moveEntry` moves an entry unchanged
+ * between the two repository files (BR11.5) and `remapSource` rewrites a
+ * source id in both (BR11.9).
  *
- * Rules: BR1.2, BR1.4–BR1.7, BR3.1, BR3.2, BR3.4, BR3.6, BR3.7, BR6.5, BR8.3, BR9.2; NFR4.2, NFR4.5, NFR4.9.
+ * Rules: BR1.2, BR1.4–BR1.7, BR3.1, BR3.2, BR3.4, BR3.6, BR3.7, BR6.5, BR8.3, BR9.2, BR11.5, BR11.9; NFR4.2, NFR4.5, NFR4.9, NFR4.15, NFR7.3.
  * @module records/install-record-service
  */
 import * as path from 'node:path';
@@ -168,6 +170,61 @@ export interface DeleteSupersededResult {
   warnings: string[];
 }
 
+/** Input of {@link InstallRecordService.moveEntry}. */
+export interface MoveEntryInput {
+  /** The repository file that holds the entry now; it moves to the other file at the same root. */
+  location: RecordLocation;
+  /** Bundle id. */
+  bundleId: string;
+  /** Tool key of the entry. */
+  tool: string;
+}
+
+/** Outcome of {@link InstallRecordService.moveEntry}. */
+export interface MoveEntryResult {
+  /** The file the entry left. */
+  from: RecordLocation;
+  /** The file the entry is in now. */
+  to: RecordLocation;
+  /** Non-fatal problems from the saves, for the caller to log. */
+  warnings: string[];
+}
+
+/** The configured source a remapped id points to: the C1 fields of `RecordSourceInput` without the key. */
+export interface RecordSourceDescriptor {
+  /** A `SourceType` value. */
+  type: string;
+  /** Source URL; credentials are removed before it is recorded (NFR4.5). */
+  url: string;
+  branch?: string;
+  collectionsPath?: string;
+  indexFile?: string;
+  authMode?: string;
+  credentialRef?: string;
+  /** Any other field is dropped, never recorded. */
+  [key: string]: unknown;
+}
+
+/** Input of {@link InstallRecordService.remapSource}. */
+export interface RemapSourceInput {
+  /** Repository root (git root) whose two record files are rewritten. */
+  root: string;
+  /** Source id to replace. */
+  from: string;
+  /** Source id to use instead. */
+  to: string;
+  /** Fields recorded under `sources.<to>`. */
+  descriptor: RecordSourceDescriptor;
+}
+
+/** Outcome of {@link InstallRecordService.remapSource}. */
+export interface RemapSourceResult {
+  /** Record files that changed and were saved, committed first; empty when nothing referred to `from`. */
+  changed: RecordLocation[];
+  /** Non-fatal problems from the saves, for the caller to log. */
+  warnings: string[];
+}
+
 /** Dependencies of an {@link InstallRecordService}. */
 export interface InstallRecordServiceOptions {
   /** Record store; loads and saves both repository files. */
@@ -258,6 +315,57 @@ const listedPaths = (records: readonly InstallRecord[]): Set<string> => {
     }
   }
   return listed;
+};
+
+/**
+ * Whether two recorded sources have the same fields and values.
+ * @param left - First source.
+ * @param right - Second source.
+ */
+const isSameSource = (left: SourceRecord, right: SourceRecord): boolean => {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  return [...keys].every((key) => left[key] === right[key]);
+};
+
+/**
+ * Remap one source id in a loaded record, in memory (BR11.9): every entry
+ * using `from` takes `to`, and `sources.<from>` becomes `sources.<to>` with
+ * the given fields. Every entry using `to` afterwards takes the source's
+ * type as its `sourceType`, so it matches `sources.<to>.type`. A record
+ * already at `to` with the same fields and types is left alone.
+ * @param record - Record to change.
+ * @param from - Source id to replace.
+ * @param to - Source id to use instead.
+ * @param source - Sanitized source to record under `to`.
+ * @returns Whether the record changed.
+ */
+const remapInRecord = (record: InstallRecord, from: string, to: string, source: SourceRecord): boolean => {
+  if (!Object.hasOwn(record.sources, from)) {
+    return false;
+  }
+  let changed = false;
+  for (const bundle of Object.values(record.bundles)) {
+    for (const entry of Object.values(bundle.tools)) {
+      if (entry.sourceId !== from && entry.sourceId !== to) {
+        continue;
+      }
+      if (entry.sourceId !== to || entry.sourceType !== source.type) {
+        changed = true;
+      }
+      entry.sourceId = to;
+      entry.sourceType = source.type;
+    }
+  }
+  if (from !== to) {
+    delete record.sources[from];
+    changed = true;
+  }
+  const current = Object.hasOwn(record.sources, to) ? record.sources[to] : undefined;
+  if (current === undefined || !isSameSource(current, source)) {
+    record.sources[to] = source;
+    changed = true;
+  }
+  return changed;
 };
 
 /** Records installs in the shared install record (contract C3). */
@@ -646,31 +754,130 @@ export class InstallRecordService {
   }
 
   /**
+   * Move one tool's entry between the committed and the local-only repository
+   * file, unchanged (BR11.5, NFR7.3): its version, `sourceId`, `sourceType`,
+   * `installedAt` and files with their checksums are copied as they are, with
+   * its source. Nothing is hashed and no sibling is synced.
+   *
+   * The target file is saved first, then the file the entry left, which is
+   * removed (with its `info/exclude` line, for the local-only file) when no
+   * bundle is left. When the second save fails, both files hold the entry;
+   * the next `moveEntry` or `recordInstall` of it leaves one copy. The target
+   * file's entry for the same bundle and tool, and its `sources.<sourceId>`,
+   * are overwritten without comparing them: that is how an interrupted move
+   * is repaired.
+   * @param input - The file holding the entry, the bundle id and the tool.
+   * @returns The two files and the save warnings.
+   * @throws {RegistryError} `RECORD.ENTRY_NOT_FOUND` when the file has no such
+   * entry, or `RECORD.MALFORMED` for a location that is not a repository file
+   * (nothing is changed); any `RECORD.*` error from loading or saving.
+   */
+  public async moveEntry(input: MoveEntryInput): Promise<MoveEntryResult> {
+    const { location, bundleId, tool } = input;
+    const targetLocation = this.otherLocation(location);
+    if (targetLocation === undefined) {
+      throw recordError('RECORD.MALFORMED', { file: path.basename(location.path), detail: 'only a repository entry can change commit mode' });
+    }
+    const from = await this.store.load(location);
+    const to = await this.store.load(targetLocation);
+    const entry = this.removeEntry(from.record, bundleId, tool);
+    if (entry === undefined) {
+      throw recordError('RECORD.ENTRY_NOT_FOUND', {
+        file: path.basename(location.path),
+        detail: `no entry for bundle ${JSON.stringify(bundleId)} and tool ${JSON.stringify(tool)}`,
+        context: { bundleId, tool }
+      });
+    }
+    // The store's load checked that the source exists.
+    const source = from.record.sources[entry.sourceId];
+    this.dropUnusedSource(from.record, entry.sourceId);
+    if (!Object.hasOwn(to.record.bundles, bundleId)) {
+      to.record.bundles[bundleId] = createBundle();
+    }
+    to.record.bundles[bundleId].tools[tool] = entry;
+    to.record.sources[entry.sourceId] = source;
+
+    const saved = await this.store.save(targetLocation, to.record);
+    const warnings = [...saved.warnings, ...(await this.saveOther(from))];
+    return { from: location, to: targetLocation, warnings };
+  }
+
+  /**
+   * Rewrite a source id in both repository files at a root (BR11.9, NFR4.15).
+   *
+   * Both files are loaded first, so a `RECORD.*` error on either stops the
+   * remap with nothing saved. In each file `sources.<from>` becomes
+   * `sources.<to>` with the descriptor's sanitized fields, and every entry
+   * whose `sourceId` is `from` takes `to`, with the descriptor's type as its
+   * `sourceType`. The committed file is saved first,
+   * then the local-only one, each only when it changed. Running it again is a
+   * no-op, so a remap whose second save failed is repaired by the next one.
+   * @param input - Root, the two ids and the source fields for `to`.
+   * @returns The files that changed and the save warnings.
+   * @throws {RegistryError} `RECORD.MALFORMED` for an id that cannot be a key,
+   * a type that is not a source type, or a descriptor without a type or url;
+   * any `RECORD.*` error from loading (nothing saved) or saving.
+   */
+  public async remapSource(input: RemapSourceInput): Promise<RemapSourceResult> {
+    const { root, from, to } = input;
+    for (const [name, value] of [['from', from], ['to', to]] as const) {
+      if (typeof value !== 'string' || value === '' || FORBIDDEN_KEYS.has(value)) {
+        throw recordError('RECORD.MALFORMED', { detail: `source id ${name} ${JSON.stringify(value)} cannot be recorded` });
+      }
+    }
+    if (!(RECORD_SOURCE_TYPES as readonly string[]).includes(input.descriptor.type)) {
+      throw recordError('RECORD.MALFORMED', { detail: `source type ${JSON.stringify(input.descriptor.type)} is not a source type` });
+    }
+    const source = sanitizeSource(input.descriptor);
+    const committedLocation: RecordLocation = { level: 'repository', root, path: path.join(root, RECORD_FILE_NAME), commitMode: 'commit' };
+    const committedFile = await this.store.load(committedLocation);
+    const loaded = [committedFile, await this.store.load(this.otherLocation(committedLocation) as RecordLocation)];
+
+    const changed = loaded.filter((file) => remapInRecord(file.record, from, to, source));
+    const warnings: string[] = [];
+    for (const file of changed) {
+      warnings.push(...(await this.store.save(file.location, file.record)).warnings);
+    }
+    return { changed: changed.map((file) => file.location), warnings };
+  }
+
+  /**
    * One status row per (bundle, tool) entry of the given record files, sorted
    * by bundle, then tool, then record path (BR9.2). Every file is loaded and
-   * checked first; a missing file has no rows.
+   * checked first; a missing file has no rows. An entry in both repository
+   * files at one root (an interrupted `moveEntry`) is listed once, from the
+   * committed file.
    * @param locations - Record files to list, e.g. `RecordSelection.locations`.
    * @returns The rows.
    * @throws {RegistryError} Any `RECORD.*` error from loading a file.
    */
   public async listEntries(locations: readonly RecordLocation[]): Promise<StatusRow[]> {
-    const rows: StatusRow[] = [];
+    const rows = new Map<string, { row: StatusRow; committed: boolean }>();
     for (const location of locations) {
       const { record } = await this.store.load(location);
+      const committed = location.commitMode !== 'local-only';
       for (const [bundleId, bundle] of Object.entries(record.bundles)) {
         for (const [tool, entry] of Object.entries(bundle.tools)) {
-          rows.push({
-            bundleId,
-            tool,
-            level: location.level,
-            version: entry.version,
-            record: location.path,
-            needsReinstall: tool === UNKNOWN_TOOL_NAME || entry.needsReinstall === true
+          const key = JSON.stringify([location.level, location.root, bundleId, tool]);
+          const existing = rows.get(key);
+          if (existing !== undefined && (existing.committed || !committed)) {
+            continue;
+          }
+          rows.set(key, {
+            committed,
+            row: {
+              bundleId,
+              tool,
+              level: location.level,
+              version: entry.version,
+              record: location.path,
+              needsReinstall: tool === UNKNOWN_TOOL_NAME || entry.needsReinstall === true
+            }
           });
         }
       }
     }
-    return rows.toSorted((left, right) =>
+    return [...rows.values()].map(({ row }) => row).toSorted((left, right) =>
       compareText(left.bundleId, right.bundleId) || compareText(left.tool, right.tool) || compareText(left.record, right.record));
   }
 
