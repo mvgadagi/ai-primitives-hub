@@ -51,7 +51,17 @@ At repository scope, `install` records the bundle in a new install record at the
 - Both record files are read before anything is written. A record that cannot be read stops the install with a `RECORD.*` error (exit 1) that names the file, and writes nothing. Run `ai-primitives-hub explain <code>` for the fix.
 - An existing `prompt-registry.lock.json` is left untouched. User-scope installs are unchanged.
 
-At repository scope, `uninstall` removes the target's tool entry from the install record and deletes its files, keeping any file another entry still lists. The record file is deleted when no bundles remain. Bundles installed before this change, which only `prompt-registry.lock.json` lists, are still uninstalled from that file. `update`, `status` and `install --lockfile` still use `prompt-registry.lock.json` for now.
+At repository scope, `uninstall` removes the target's tool entry from the install record and deletes its files, keeping any file another entry still lists. The record file is deleted when no bundles remain. Bundles installed before this change, which only `prompt-registry.lock.json` lists, are still uninstalled from that file.
+
+Every command that reads or changes the record ends its text output with `Record: <level> <path>`, and its `-o json` data carries `level` and `records` (the record files read).
+
+- **`update`** updates every tool that has the bundle in the record, each with its own configured target. Only `--target` narrows the run to that target's tool; a target picked automatically only decides which record is used. Tools that share files with the updated one (for example `vscode` and `vscode-insiders` in `.github/`) are brought to the same version and reported in `alsoUpdated`. An entry with no matching target, or a sharing tool that cannot be updated, is reported in `skipped` with the reason, and the status is `warning`.
+- **`install --lockfile <ai-primitives-hub.*.lock.json>`**, or a bare `install` in a repository that has a record, reinstalls every recorded tool at its recorded version and records it again in the same file. Entries under the `unknown` tool are listed in `needsReinstall` and are not restored. `skipped` lists entries with no matching target.
+- **`uninstall <id>`** without `--target` is refused when the bundle is recorded for several tools; the error lists them. `uninstall --lockfile <ai-primitives-hub.*.lock.json> --target <name>` removes only that target's tool entries.
+- **`status`** lists one row per bundle and tool. In `-o json`, the `lockfile` field is replaced by `level`, `records` and `entries`. Bundles that only `prompt-registry.lock.json` lists are still shown, with that file as their record.
+- **Sources.** A recorded source is used only through the matching configured source (the active hub's sources first, then sources added with `source add`), with that source's URL and credentials. Without one, the recorded copy is used without its `credentialRef`, and a recorded `local` folder must be inside the repository, or the entry is skipped. This also applies to `update --dry-run`.
+
+`prompt-registry.lock.json` files and user-scope installs keep their current behaviour.
 
 The VS Code extension lists bundles from the install record as repository-scope installs, and refuses to uninstall, update, move or switch the commit mode of those entries, since the CLI manages them (`RECORD.CLI_MANAGED`).
 
