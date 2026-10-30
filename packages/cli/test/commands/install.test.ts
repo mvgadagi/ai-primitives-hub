@@ -76,6 +76,12 @@ const COMMAND_CLASSES = [
 interface JsonEnvelope<T> {
   status: string;
   data: T;
+  errors?: { code: string; context?: Record<string, unknown> }[];
+}
+
+/** The parts of a 3.0.0 install record these tests read. */
+interface InstallRecordJson {
+  bundles: Record<string, { tools: Record<string, { files: { path: string }[] }> }>;
 }
 
 describe('install command (local --from mode)', () => {
@@ -671,7 +677,7 @@ agents:
     expect(result.exitCode).toBe(0);
 
     const envelope = parseJson<{ lockfile: string }>(result.stdout);
-    expect(envelope.data.lockfile).toBe(path.join(workspace, 'prompt-registry.local.lock.json'));
+    expect(envelope.data.lockfile).toBe(path.join(workspace, 'ai-primitives-hub.local.lock.json'));
     await expect(
       readFile(path.join(workspace, '.github', 'prompts', 'hello.prompt.md'), 'utf8')
     ).resolves.toContain('Hello Prompt');
@@ -776,6 +782,8 @@ agents:
     await expect(
       readFile(path.join(workspace, '.github', 'prompts', 'hello.prompt.md'), 'utf8')
     ).resolves.toContain('Hello from a remote bundle');
+    const envelope = JSON.parse(ctx.stdout.captured()) as JsonEnvelope<{ lockfile: string }>;
+    expect(envelope.data.lockfile).toBe(path.join(workspace, 'ai-primitives-hub.lock.json'));
     await expect(
       readFile(path.join(workspace, '.github', 'copilot', 'prompts', 'hello.prompt.md'), 'utf8')
     ).rejects.toThrow();
@@ -947,8 +955,13 @@ agents:
     const isExecutable = async (filePath: string): Promise<boolean> =>
       // eslint-disable-next-line no-bitwise -- test reads the POSIX execute bits
       ((await stat(filePath)).mode & 0o111) !== 0;
-    const lockedFiles = async (lockfilePath: string): Promise<unknown> =>
-      (JSON.parse(await readFile(lockfilePath, 'utf8')) as Lockfile).bundles['exec-demo'].files;
+    // User scope keeps the 2.0.0 lockfile (`bundles.<id>.files`); repository
+    // scope now writes the 3.0.0 install record (`bundles.<id>.tools.<type>.files`).
+    const lockedFiles = async (lockfilePath: string): Promise<unknown> => {
+      const parsed = JSON.parse(await readFile(lockfilePath, 'utf8')) as Lockfile | InstallRecordJson;
+      const bundle = parsed.bundles['exec-demo'] as { files?: unknown; tools?: Record<string, { files: unknown }> };
+      return bundle.tools === undefined ? bundle.files : bundle.tools['copilot-cli'].files;
+    };
     const installFrom = async (extra: string[] = []): Promise<string> => {
       const result = await run(['install', 'exec-demo', '--from', execBundleDir, '--target', 'copilot', ...extra, '-o', 'json']);
       expect(result.exitCode, result.stdout).toBe(0);
@@ -1057,6 +1070,95 @@ agents:
       expect(await isExecutable(path.join(skillDir(), 'SKILL.md'))).toBe(false);
       expect(await readFile(path.join(skillDir(), 'scripts', 'run.sh'), 'utf8')).toBe(SCRIPT);
       expect(await lockedFiles(lockfilePath)).toEqual(baselineLock);
+    });
+  });
+
+  describe('repository install record (ai-primitives-hub.lock.json, format 3.0.0)', () => {
+    const recordPath = (): string => path.join(workspace, 'ai-primitives-hub.lock.json');
+    const vscodePrompt = (): string => path.join(workspace, '.github', 'prompts', 'hello.prompt.md');
+    const readRecord = async (): Promise<InstallRecordJson> =>
+      JSON.parse(await readFile(recordPath(), 'utf8')) as InstallRecordJson;
+    const installTo = (targetName: string): ReturnType<typeof runCommand> =>
+      run(['install', 'local-foo', '--from', bundleDir, '--target', targetName, '-o', 'json']);
+
+    beforeEach(async () => {
+      await mkdir(path.join(workspace, '.git'), { recursive: true });
+      await writeFile(path.join(workspace, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+      for (const [name, type] of [['repo-vscode', 'vscode'], ['repo-kiro', 'kiro']]) {
+        expect((await run([
+          'target', 'add', name, '--type', type, '--scope', 'repository', '--workspace-root', workspace, '-o', 'json'
+        ])).exitCode).toBe(0);
+      }
+    });
+
+    it('records vscode then kiro installs of one bundle in one record', async () => {
+      expect((await installTo('repo-vscode')).exitCode).toBe(0);
+      const result = await installTo('repo-kiro');
+
+      expect(result.exitCode, result.stdout).toBe(0);
+      expect(parseJson<{ lockfile: string }>(result.stdout).data.lockfile).toBe(recordPath());
+      expect(Object.keys((await readRecord()).bundles['local-foo'].tools).toSorted()).toEqual(['kiro', 'vscode']);
+    });
+
+    it('leaves existing prompt-registry lockfiles byte-identical', async () => {
+      const legacy = '{"version":"2.0.0","bundles":{"old":{}},"sources":{}}\n';
+      await writeFile(path.join(workspace, 'prompt-registry.lock.json'), legacy);
+      await writeFile(path.join(workspace, 'prompt-registry.local.lock.json'), legacy);
+
+      expect((await installTo('repo-vscode')).exitCode).toBe(0);
+
+      expect(await readFile(path.join(workspace, 'prompt-registry.lock.json'), 'utf8')).toBe(legacy);
+      expect(await readFile(path.join(workspace, 'prompt-registry.local.lock.json'), 'utf8')).toBe(legacy);
+    });
+
+    it.each([
+      ['RECORD.MALFORMED', '{ "version": "3.0.0", '],
+      ['RECORD.NEWER_FORMAT', '{"version":"4.0.0","bundles":{}}\n']
+    ])('exits 1 with %s and writes no file when the record is bad', async (code, text) => {
+      await writeFile(recordPath(), text);
+
+      const result = await installTo('repo-vscode');
+
+      expect(result.exitCode).toBe(1);
+      expect(parseJson<null>(result.stdout).errors?.[0]).toMatchObject({ code, context: { file: 'ai-primitives-hub.lock.json' } });
+      await expect(readFile(vscodePrompt(), 'utf8')).rejects.toThrow();
+      expect(await readFile(recordPath(), 'utf8')).toBe(text);
+    });
+
+    it('removes a file the reinstall no longer writes', async () => {
+      const writeBundle = (withAgent: boolean): Promise<void> => writeReleaseArchive(bundleDir, new Map([
+        ['deployment-manifest.yml', new TextEncoder().encode([
+          'id: local-foo', 'version: 1.0.0', 'name: Local Bundle', 'prompts:',
+          '  - id: hello', '    file: prompts/hello.prompt.md', '    type: prompt',
+          ...(withAgent ? ['agents:', '  - id: hello-agent', '    file: agents/hello.agent.md', '    type: agent'] : [])
+        ].join('\n'))],
+        ['prompts/hello.prompt.md', new TextEncoder().encode('# Hello Prompt\n')],
+        ...(withAgent ? [['agents/hello.agent.md', new TextEncoder().encode('# Hello Agent\n')] as [string, Uint8Array]] : [])
+      ]));
+      const agentFile = path.join(workspace, '.github', 'agents', 'hello.agent.md');
+      await writeBundle(true);
+      expect((await installTo('repo-vscode')).exitCode).toBe(0);
+      await expect(readFile(agentFile, 'utf8')).resolves.toContain('Hello Agent');
+
+      await writeBundle(false);
+      expect((await installTo('repo-vscode')).exitCode).toBe(0);
+
+      await expect(readFile(agentFile, 'utf8')).rejects.toThrow();
+      await expect(readFile(vscodePrompt(), 'utf8')).resolves.toContain('Hello Prompt');
+    });
+
+    it('keeps user-scope installs on the existing user lockfile', async () => {
+      const result = await run(['install', 'local-foo', '--from', bundleDir, '--target', 'copilot', '-o', 'json']);
+
+      expect(result.exitCode, result.stdout).toBe(0);
+      const userLockfile = resolveUserConfigPaths({
+        HOME: workspace,
+        USERPROFILE: workspace,
+        XDG_CONFIG_HOME: path.join(workspace, 'xdg-config'),
+        XDG_CACHE_HOME: path.join(workspace, 'xdg-cache')
+      }).userLockfile;
+      expect(parseJson<{ lockfile: string }>(result.stdout).data.lockfile).toBe(userLockfile);
+      await expect(readFile(recordPath(), 'utf8')).rejects.toThrow();
     });
   });
 });

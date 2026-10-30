@@ -30,3 +30,4 @@ export * from './primitive-diagnostics-driver';
 export * from './hub-contribution';
 export * from './collection-contribution';
 export * from './repository-exclusion';
+export * from './record-fs';
