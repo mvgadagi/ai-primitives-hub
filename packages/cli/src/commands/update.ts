@@ -16,9 +16,13 @@ import {
   type Lockfile,
   type LockfileBundleEntry,
   type LockfileSourceEntry,
+  mapToolToTarget,
   readLockfile,
+  type RecordInstallResult,
   removeSupersededFiles,
+  resolveRecordSource,
   resolveUserConfigPaths,
+  type TargetMapping,
   type TargetWriter,
   TransformerRegistry,
   upsertBundleEntry,
@@ -27,16 +31,21 @@ import {
   writeLockfile,
 } from '@ai-primitives-hub/app';
 import type {
+  ExtractedFiles,
   GitHubApi,
   GitHubRepositoryTarget,
   GitHubSourceAuthCategory,
   HttpClient,
   HubSourceSpec,
   Installable,
+  RecordLevel,
+  RecordLocation,
   RegistrySource,
   SourceType,
   Target,
   TokenProvider,
+  ToolEntry,
+  ValidatedManifest,
 } from '@ai-primitives-hub/core';
 import {
   validateManifest,
@@ -65,24 +74,30 @@ import {
   ZipBundleExtractor,
 } from '@ai-primitives-hub/infra';
 import {
+  CLI_RECORD_GENERATED_BY,
   Command,
+  configuredSources,
+  type Context,
   createHubManager,
   failWith,
   findProjectLockfile,
+  formatOutput,
   loadInquirer,
   loadTargets,
   lockfilePathForTarget,
   Option,
-  resolveEffectiveTarget,
-} from '../framework';
-import {
-  type Context,
-  formatOutput,
   type OutputFormat,
+  type PreparedRecordSelection,
+  prepareRecordSelection,
   readTargetsSafely,
+  recordOutputFields,
   RegistryError,
+  renderRecordLine,
+  resolveEffectiveTarget,
   resolveTarget,
   resolveTargetName,
+  toLockfileBundleEntry,
+  toLockfileSourceEntry,
 } from '../framework';
 
 /**
@@ -239,6 +254,24 @@ export class UpdateCommand extends BaseUpdateCommand {
       const targetName = await resolveTargetName(opts.target, 'update', ctx, () => loadTargets(ctx));
       const configuredTarget = await resolveTarget(targetName, 'update', ctx, () => loadTargets(ctx));
       const target = resolveEffectiveTarget(ctx, configuredTarget, opts);
+
+      // Select the record first: every selected file is loaded and checked
+      // before anything is fetched or written (W5 step 1, NFR4.8).
+      const prepared = await prepareRecordSelection(ctx, { command: 'update', lockfile: this.lockfile, scope: opts.scope }, target);
+      if (prepared.selection.level === 'repository' && prepared.selection.locations.length > 0) {
+        const rows = await prepared.service.listEntries(prepared.selection.locations);
+        if (rows.length > 0) {
+          if (!this.noHubSync) {
+            await syncActiveHub(ctx);
+          }
+          return await updateFromRecord({
+            ctx, fmt, http, tokens, prepared, target,
+            explicit: this.target !== undefined && this.target.length > 0 ? target : undefined,
+            dryRun: this.dryRun,
+            interactive: this.interactive
+          });
+        }
+      }
 
       const commitMode = target.commitMode ?? 'commit';
       const scope = target.scope;
@@ -411,12 +444,14 @@ async function findUpdateCandidates(
   lock: Lockfile,
   ctx: Context,
   http: HttpClient,
-  tokens: TokenProvider
+  tokens: TokenProvider,
+  anonymous = false
 ): Promise<{ candidates: UpdateCandidate[]; skipped: string[]; failures: string[] }> {
   const candidates: UpdateCandidate[] = [];
   const skipped: string[] = [];
   const failures: string[] = [];
-  const sourceAware = isGitHubAppAuthEnabled(ctx.env);
+  // A source taken from the record runs without credentials (NFR4.11).
+  const sourceAware = !anonymous && isGitHubAppAuthEnabled(ctx.env);
   const githubApi = new GitHubApiClient(http, { tokenProvider: tokens });
   const dispatcher = new SourceDispatcher({ githubApi, fs: ctx.fs });
   const sourceDependencies = new Map<string, SourceAwareUpdateDependencies>();
@@ -619,20 +654,8 @@ async function applyUpdate(
   http: HttpClient,
   tokens: TokenProvider
 ): Promise<void> {
-  const downloader = candidate.source.type === 'artifactory' && candidate.artifactoryClient !== undefined
-    ? new ArtifactoryBundleDownloader(candidate.artifactoryClient)
-    : new HttpsBundleDownloader(
-      http,
-      candidate.downloadTokens ?? tokens,
-      candidate.repositoryTarget,
-      candidate.authenticationCategory
-    );
-  const extractor = new ZipBundleExtractor();
-
-  const dl = await downloader.download(candidate.installable);
-  const files = await extractor.extract(dl.bytes);
+  const { dl, files, manifest } = await downloadCandidate(candidate, http, tokens);
   const isArtifactory = candidate.source.type === 'artifactory';
-  const manifest = validateManifest(files, { expectedId: undefined, expectedVersion: isArtifactory ? candidate.installable.ref.bundleVersion : undefined });
 
   const writer = writerFor(ctx, target, scope, commitMode);
   const { installableFiles: targetFiles, result } = await writeBundleSafely(writer, target, files, manifest);
@@ -659,16 +682,465 @@ async function applyUpdate(
   nextLock = upsertSource(nextLock, candidate.entry.sourceId, candidate.source);
   await writeLockfile(lockPath, nextLock, ctx.fs);
   await removeSupersededFiles(writer, target, previousFiles, entry.files);
+  await saveTargetState(ctx, target, lockKey, manifest.version);
+}
 
+/**
+ * Download, extract and validate a candidate's new version.
+ * @param candidate Update candidate, carrying the source it was looked up from.
+ * @param http HTTP client.
+ * @param tokens Fallback GitHub token provider.
+ * @returns The download, its extracted files and the validated manifest.
+ */
+async function downloadCandidate(
+  candidate: UpdateCandidate,
+  http: HttpClient,
+  tokens: TokenProvider
+): Promise<{ dl: { bytes: Uint8Array; sha256: string }; files: ExtractedFiles; manifest: ValidatedManifest }> {
+  const downloader = candidate.source.type === 'artifactory' && candidate.artifactoryClient !== undefined
+    ? new ArtifactoryBundleDownloader(candidate.artifactoryClient)
+    : new HttpsBundleDownloader(
+      http,
+      candidate.downloadTokens ?? tokens,
+      candidate.repositoryTarget,
+      candidate.authenticationCategory
+    );
+  const extractor = new ZipBundleExtractor();
+
+  const dl = await downloader.download(candidate.installable);
+  const files = await extractor.extract(dl.bytes);
+  const isArtifactory = candidate.source.type === 'artifactory';
+  const manifest = validateManifest(files, { expectedId: undefined, expectedVersion: isArtifactory ? candidate.installable.ref.bundleVersion : undefined });
+  return { dl, files, manifest };
+}
+
+/**
+ * Record a bundle's new version in the target's last-installed state.
+ * @param ctx CLI context.
+ * @param target Target the bundle was written to.
+ * @param bundleId Bundle id.
+ * @param version New version.
+ */
+async function saveTargetState(ctx: Context, target: Target, bundleId: string, version: string): Promise<void> {
   const stateStore = new TargetStateStore({ fs: ctx.fs, statePath: path.join(ctx.cwd(), '.ai-primitives-hub', 'target-state.json') });
   const existingState = await stateStore.load(target.name);
   const bundles = existingState?.lastInstalledBundles ?? [];
-  const idx = bundles.findIndex((b) => b.bundleId === lockKey);
-  const bundleState = { bundleId: lockKey, version: manifest.version, installedAt: new Date().toISOString() };
+  const idx = bundles.findIndex((b) => b.bundleId === bundleId);
+  const bundleState = { bundleId, version, installedAt: new Date().toISOString() };
   if (idx === -1) {
     bundles.push(bundleState);
   } else {
     bundles[idx] = bundleState;
   }
   await stateStore.save({ targetName: target.name, lastInstalledBundles: bundles, lastUsedAt: new Date().toISOString() });
+}
+
+// ---------------------------------------------------------------------------
+// Repository install record (format 3.0.0) — workflow W5.
+// ---------------------------------------------------------------------------
+
+/** One (bundle, tool) entry to update, with its mapped target and decided source. */
+interface RecordPlanItem {
+  bundleId: string;
+  tool: string;
+  /** The file that holds the entry (BR6.5). */
+  location: RecordLocation;
+  entry: ToolEntry;
+  sourceId: string;
+  /** Source decided by the trust gate, in the legacy lockfile shape (NFR4.11). */
+  source: LockfileSourceEntry;
+  /** Mapped target, made effective (BR6.4). */
+  target: Target;
+  /** `true` when the trust gate took the source from the record: no configured source matched (NFR4.11). */
+  fromRecord: boolean;
+}
+
+/** A (bundle, tool) entry that was not updated, and why. */
+interface SkippedRecordEntry {
+  bundleId: string;
+  tool: string;
+  reason: string;
+}
+
+/** Inputs of {@link updateFromRecord}. */
+interface RecordUpdateRun {
+  ctx: Context;
+  fmt: OutputFormat;
+  http: HttpClient;
+  tokens: TokenProvider;
+  prepared: PreparedRecordSelection;
+  /** The resolved target; it writes the old-file-only bundles, as today (BR10.1). */
+  target: Target;
+  /** The target named by `--target`; only it narrows the plan to one tool (BR6.1). */
+  explicit?: Target;
+  dryRun: boolean;
+  interactive: boolean;
+}
+
+/** What {@link updateFromRecord} reports. */
+interface RecordUpdateData {
+  dryRun?: true;
+  level: RecordLevel;
+  records: string[];
+  checked: number;
+  updated: number;
+  updates: { bundleId: string; tool: string; from: string; to: string }[];
+  alsoUpdated: { bundleId: string; tool: string }[];
+  skipped: SkippedRecordEntry[];
+  failures: string[];
+  /** Bundles only in the old `prompt-registry.*` file, handled with today's code (BR10.1). */
+  oldFile?: OldFileUpdate;
+}
+
+/** What {@link updateOldFileOnly} reports for the old `prompt-registry.*` file. */
+interface OldFileUpdate {
+  /** Absolute path of the old file. */
+  lockfile: string;
+  /** Old-file-only bundles checked. */
+  checked: number;
+  updated: number;
+  updates: UpdateEntry[];
+  /** Old-file-only bundles that could not be looked up or are not remote. */
+  skipped: number;
+  failures: string[];
+}
+
+const entryKey = (bundleId: string, tool: string): string => `${bundleId}\u0000${tool}`;
+
+/**
+ * A one-bundle legacy lockfile for `findUpdateCandidates`, built from the
+ * record entry and the decided source only, so the record's own url and
+ * credentials never reach the lookup unless the configured source matched.
+ * @param item Plan item.
+ */
+const lookupLockfile = (item: RecordPlanItem): Lockfile => ({
+  $schema: '',
+  version: '2.0.0',
+  generatedAt: '',
+  generatedBy: CLI_RECORD_GENERATED_BY,
+  bundles: { [item.bundleId]: toLockfileBundleEntry(item.entry) },
+  sources: { [item.sourceId]: item.source }
+});
+
+/** Token provider that never returns a token. */
+const NO_TOKENS: TokenProvider = new StaticTokenProvider('');
+
+/**
+ * The token provider for an item's lookup and download: none for a source the
+ * trust gate took from the record, so such a fetch runs without credentials (NFR4.11).
+ * @param run Update inputs.
+ * @param item Plan item.
+ */
+const tokensFor = (run: Pick<RecordUpdateRun, 'tokens'>, item: Pick<RecordPlanItem, 'fromRecord'>): TokenProvider =>
+  item.fromRecord ? NO_TOKENS : run.tokens;
+
+/**
+ * Write a downloaded bundle with a target's own writer.
+ * @param ctx CLI context.
+ * @param target Effective target.
+ * @param files Extracted bundle files.
+ * @param manifest Validated manifest.
+ * @returns The writer's `written` list (absolute paths).
+ */
+async function writeForTarget(ctx: Context, target: Target, files: ExtractedFiles, manifest: ValidatedManifest): Promise<string[]> {
+  const writer = writerFor(ctx, target, target.scope, target.commitMode ?? 'commit');
+  const { result } = await writeBundleSafely(writer, target, files, manifest);
+  return [...result.written];
+}
+
+/**
+ * Build the update plan from the selected record (W5 steps 2–3): every
+ * (bundle, tool) entry at the level except `unknown`, narrowed to one tool
+ * only by an explicit `--target`. Each tool is mapped to a configured target
+ * and each source goes through the trust gate here, before any lookup or
+ * download and also under `--dry-run` (NFR4.10, NFR4.11).
+ * @param run Update inputs.
+ * @param mapTool Cached tool-to-target mapping.
+ * @returns The plan items, the skipped entries and the mapping notes.
+ */
+async function planRecordUpdates(
+  run: RecordUpdateRun,
+  mapTool: (tool: string) => Promise<TargetMapping>
+): Promise<{ items: RecordPlanItem[]; skipped: SkippedRecordEntry[]; notes: string[] }> {
+  const { ctx, prepared, explicit } = run;
+  const { selection, store, service, fs } = prepared;
+  const configured = await configuredSources(ctx);
+  const items: RecordPlanItem[] = [];
+  const skipped: SkippedRecordEntry[] = [];
+  const notes = new Set<string>();
+  for (const row of await service.listEntries(selection.locations)) {
+    if (row.needsReinstall || (explicit !== undefined && row.tool !== explicit.type)) {
+      continue;
+    }
+    const { bundleId, tool } = row;
+    const mapping = await mapTool(tool);
+    if ('skip' in mapping) {
+      skipped.push({ bundleId, tool, reason: mapping.skip });
+      continue;
+    }
+    if (mapping.note !== undefined) {
+      notes.add(mapping.note);
+    }
+    const location = selection.locations.find((candidate) => candidate.path === row.record);
+    if (location === undefined) {
+      continue;
+    }
+    const { record } = await store.load(location);
+    const entry = record.bundles[bundleId].tools[tool];
+    const fromRecord = Object.hasOwn(record.sources, entry.sourceId) ? record.sources[entry.sourceId] : undefined;
+    if (fromRecord === undefined) {
+      skipped.push({ bundleId, tool, reason: `source ${entry.sourceId} is not in the record` });
+      continue;
+    }
+    const decision = await resolveRecordSource(entry.sourceId, fromRecord, configured, selection.root, fs);
+    if ('skip' in decision) {
+      skipped.push({ bundleId, tool, reason: decision.skip });
+      continue;
+    }
+    items.push({
+      bundleId,
+      tool,
+      location,
+      entry,
+      sourceId: entry.sourceId,
+      source: toLockfileSourceEntry(decision.use),
+      target: resolveEffectiveTarget(ctx, mapping.target),
+      fromRecord: !configured.has(entry.sourceId)
+    });
+  }
+  return { items, skipped, notes: [...notes] };
+}
+
+/**
+ * Apply one update (W5 steps 4–5): write with the mapped target's writer,
+ * re-record the entry under its key in the file that holds it, then run each
+ * synced sibling's own writer at the new version and re-record it with
+ * `syncSiblings: false`. Superseded files are not deleted here; the caller
+ * deletes them after every save.
+ * @param run Update inputs.
+ * @param item Plan item.
+ * @param candidate Its update candidate, looked up from the decided source.
+ * @param siblingTargets Mapped targets of the bundle's other tools.
+ * @returns The record changes and the siblings synced or left out of date.
+ */
+async function applyRecordUpdate(
+  run: RecordUpdateRun,
+  item: RecordPlanItem,
+  candidate: UpdateCandidate,
+  siblingTargets: ReadonlyMap<string, Target>
+): Promise<{ version: string; changes: RecordInstallResult[]; synced: string[]; outOfDate: { tool: string; version: string }[] }> {
+  const { ctx, http, prepared } = run;
+  const { files, manifest } = await downloadCandidate(candidate, http, tokensFor(run, item));
+  const source = { sourceId: item.sourceId, ...item.source };
+  const record = async (tool: string, location: RecordLocation, target: Target, syncSiblings: false | ((sibling: string) => boolean)) =>
+    prepared.service.recordInstall({
+      location,
+      bundleId: item.bundleId,
+      version: manifest.version,
+      tool,
+      source,
+      sourceType: item.source.type,
+      writtenPaths: await writeForTarget(ctx, target, files, manifest),
+      workspaceRoot: target.rootPath ?? ctx.cwd(),
+      syncSiblings
+    });
+  const change = await record(item.tool, item.location, item.target, (sibling) => siblingTargets.has(sibling));
+  const changes = [change];
+  const synced: string[] = [];
+  const outOfDate: { tool: string; version: string }[] = [];
+  for (const sibling of change.siblings) {
+    const siblingTarget = siblingTargets.get(sibling.tool);
+    if (!sibling.synced || siblingTarget === undefined) {
+      outOfDate.push({ tool: sibling.tool, version: sibling.version });
+      continue;
+    }
+    changes.push(await record(sibling.tool, sibling.location, siblingTarget, false));
+    synced.push(sibling.tool);
+  }
+  await saveTargetState(ctx, item.target, item.bundleId, manifest.version);
+  return { version: manifest.version, changes, synced, outOfDate };
+}
+
+/**
+ * Text output of the repository record update.
+ * @param d Output data.
+ */
+function renderRecordUpdateOutput(d: RecordUpdateData & { recordLine: string }): string {
+  const lines: string[] = [];
+  const updateLines = d.updates.map((u) => `  ${u.bundleId} (${u.tool}): ${u.from} → ${u.to}`);
+  if (d.dryRun === true) {
+    lines.push(...(updateLines.length > 0 ? [`Available updates (${String(updateLines.length)}):`, ...updateLines] : []));
+  } else if (updateLines.length > 0) {
+    lines.push(`Updated ${String(updateLines.length)} entr${updateLines.length === 1 ? 'y' : 'ies'}:`, ...updateLines);
+  }
+  if (lines.length === 0 && d.failures.length === 0) {
+    lines.push(`All bundles are up to date. (checked ${String(d.checked)})`);
+  }
+  lines.push(...d.alsoUpdated.map((a) => `Also updated ${a.bundleId} for ${a.tool}.`),
+    ...d.skipped.map((s) => `Skipped ${s.bundleId} (${s.tool}): ${s.reason}`));
+  if (d.oldFile !== undefined) {
+    const old = d.oldFile;
+    const verb = d.dryRun === true ? 'available' : 'updated';
+    lines.push(`Old file ${old.lockfile}: ${String(old.updates.length)} of ${String(old.checked)} bundle${old.checked === 1 ? '' : 's'} ${verb}.`,
+      ...old.updates.map((u) => `  ${u.bundleId}: ${u.from} → ${u.to}`));
+  }
+  if (d.failures.length > 0) {
+    lines.push(`${String(d.failures.length)} update check${d.failures.length === 1 ? '' : 's'} or installation${d.failures.length === 1 ? '' : 's'} failed. Review the reported failures.`);
+  }
+  if (d.dryRun === true && updateLines.length > 0) {
+    lines.push('Re-run without --dry-run to apply.');
+  }
+  return lines.join('\n') + '\n' + d.recordLine;
+}
+
+/**
+ * Update the bundles of the selected repository record (W5; BR6.1, BR6.4,
+ * BR6.5, BR8.1–BR8.3, NFR4.8–NFR4.11). Every entry is gated, mapped and
+ * looked up from its decided source before anything is downloaded.
+ * @param run Update inputs.
+ * @returns Exit code: 1 when a lookup or an update failed, else 0.
+ */
+async function updateFromRecord(run: RecordUpdateRun): Promise<number> {
+  const { ctx, fmt, http, prepared, explicit } = run;
+  const { selection, service, fs } = prepared;
+  const targets = await readTargetsSafely(loadTargets(ctx));
+  const mappings = new Map<string, TargetMapping>();
+  const mapTool = async (tool: string): Promise<TargetMapping> => {
+    let mapping = mappings.get(tool);
+    if (mapping === undefined) {
+      mapping = await mapToolToTarget({ fs, tool, level: selection.level, gitRoot: selection.root, targets, explicit, cwd: ctx.cwd() });
+      mappings.set(tool, mapping);
+    }
+    return mapping;
+  };
+
+  const { items, skipped, notes } = await planRecordUpdates(run, mapTool);
+  const checked = items.length + skipped.length;
+  const failures: string[] = [];
+  const found: { item: RecordPlanItem; candidate: UpdateCandidate }[] = [];
+  for (const item of items.filter((planned) => isRemoteSource(planned.source.type))) {
+    const lookup = await findUpdateCandidates([item.bundleId], lookupLockfile(item), ctx, http, tokensFor(run, item), item.fromRecord);
+    failures.push(...lookup.failures);
+    found.push(...lookup.candidates.map((candidate) => ({ item, candidate })));
+  }
+
+  const data: RecordUpdateData = {
+    ...await recordOutputFields(selection, fs),
+    checked,
+    updated: 0,
+    updates: [],
+    alsoUpdated: [],
+    skipped,
+    failures
+  };
+  const warnings = [...notes];
+  if (run.dryRun) {
+    data.dryRun = true;
+    data.updates = found.map(({ item, candidate }) => ({ bundleId: item.bundleId, tool: item.tool, from: candidate.from, to: candidate.to }));
+  } else {
+    const chosen = new Set(await selectUpdatesInteractively(run.interactive, found.map(({ candidate }) => candidate)));
+    const rows = await service.listEntries(selection.locations);
+    const done = new Set<string>();
+    const changes: RecordInstallResult[] = [];
+    for (const { item, candidate } of found.filter((pair) => chosen.has(pair.candidate))) {
+      if (done.has(entryKey(item.bundleId, item.tool))) {
+        continue;
+      }
+      const siblingTargets = new Map<string, Target>();
+      for (const row of rows.filter((other) => other.bundleId === item.bundleId && other.tool !== item.tool && !other.needsReinstall)) {
+        const mapping = await mapTool(row.tool);
+        if ('target' in mapping) {
+          siblingTargets.set(row.tool, resolveEffectiveTarget(ctx, mapping.target));
+        }
+      }
+      try {
+        const applied = await applyRecordUpdate(run, item, candidate, siblingTargets);
+        changes.push(...applied.changes);
+        done.add(entryKey(item.bundleId, item.tool));
+        data.updates.push({ bundleId: item.bundleId, tool: item.tool, from: candidate.from, to: applied.version });
+        for (const tool of applied.synced) {
+          done.add(entryKey(item.bundleId, tool));
+          data.alsoUpdated.push({ bundleId: item.bundleId, tool });
+        }
+        for (const stale of applied.outOfDate) {
+          const mapping = await mapTool(stale.tool);
+          const why = 'skip' in mapping ? mapping.skip : 'not updated';
+          const existing = skipped.find((s) => s.bundleId === item.bundleId && s.tool === stale.tool);
+          const reason = `out of date (still ${stale.version}): ${existing?.reason ?? why}`;
+          if (existing === undefined) {
+            skipped.push({ bundleId: item.bundleId, tool: stale.tool, reason });
+          } else {
+            existing.reason = reason;
+          }
+        }
+      } catch (error) {
+        failures.push(`Failed to update ${item.bundleId} for ${item.tool}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    // Superseded files go only after every save, keeping any file an entry of either file still lists (FR3.2, NFR4.9).
+    const removal = await service.deleteSupersededAfterAll(changes);
+    warnings.push(...changes.flatMap((change) => change.warnings), ...removal.warnings);
+    data.updated = data.updates.length;
+  }
+
+  // Bundles only in the old file are updated as today, on that file; the record wins for the others (BR10.1).
+  const recorded = new Set((await service.listEntries(selection.locations)).map((row) => row.bundleId));
+  const oldFile = await updateOldFileOnly(run, recorded);
+  if (oldFile !== undefined) {
+    data.oldFile = oldFile;
+    failures.push(...oldFile.failures);
+  }
+
+  // Exit 1 when nothing at all could be processed: every planned entry was skipped (BR6.4).
+  const nothingProcessed = checked > 0 && items.length === 0 && (oldFile === undefined || oldFile.checked === oldFile.skipped);
+  formatOutput({
+    ctx,
+    command: 'update',
+    output: fmt,
+    status: failures.length > 0 || skipped.length > 0 ? 'warning' : 'ok',
+    data,
+    warnings: [...warnings, ...failures],
+    textRenderer: (d) => renderRecordUpdateOutput({ ...d, recordLine: renderRecordLine({ level: d.level, records: d.records }) })
+  });
+  return failures.length > 0 || nothingProcessed ? 1 : 0;
+}
+
+/**
+ * Update the bundles that are only in the selected level's old
+ * `prompt-registry.*` file with today's code, on that file, writing nothing
+ * about them into the new record (BR10.1; W5 step 6).
+ * @param run Update inputs; `run.target` writes the old-file bundles, as today.
+ * @param recorded Bundle ids the new record has; the record wins for them.
+ * @returns What was checked and updated, or `undefined` when there is no old-file-only bundle.
+ */
+async function updateOldFileOnly(run: RecordUpdateRun, recorded: ReadonlySet<string>): Promise<OldFileUpdate | undefined> {
+  const { ctx, http, tokens, target } = run;
+  const lockPath = run.prepared.selection.oldLockfile;
+  const lock = lockPath === undefined ? null : await readLockfile(lockPath, ctx.fs);
+  if (lockPath === undefined || lock === null) {
+    return undefined;
+  }
+  const bundleIds = Object.keys(lock.bundles).filter((bundleId) => !recorded.has(bundleId));
+  if (bundleIds.length === 0) {
+    return undefined;
+  }
+  const remote = bundleIds.filter((bundleId) => {
+    const src = lock.sources[lock.bundles[bundleId].sourceId];
+    return src !== undefined && isRemoteSource(src.type);
+  });
+  const { candidates, skipped, failures } = await findUpdateCandidates(remote, lock, ctx, http, tokens);
+  const checkedOnly: OldFileUpdate = {
+    lockfile: lockPath,
+    checked: bundleIds.length,
+    updated: 0,
+    updates: candidates.map((c) => ({ bundleId: c.bundleId, from: c.from, to: c.to })),
+    skipped: skipped.length,
+    failures
+  };
+  if (run.dryRun) {
+    return checkedOnly;
+  }
+  const toInstall = await selectUpdatesInteractively(run.interactive, candidates);
+  const applied = await applyUpdates(toInstall, target, target.scope, target.commitMode ?? 'commit', lockPath, ctx, http, tokens);
+  return { ...checkedOnly, updated: applied.updatedCount, updates: applied.updateResults, failures: [...failures, ...applied.failures] };
 }
