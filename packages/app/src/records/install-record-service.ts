@@ -330,7 +330,9 @@ const isSameSource = (left: SourceRecord, right: SourceRecord): boolean => {
 /**
  * Remap one source id in a loaded record, in memory (BR11.9): every entry
  * using `from` takes `to`, and `sources.<from>` becomes `sources.<to>` with
- * the given fields. A record already at `to` with the same fields is left alone.
+ * the given fields. Every entry using `to` afterwards takes the source's
+ * type as its `sourceType`, so it matches `sources.<to>.type`. A record
+ * already at `to` with the same fields and types is left alone.
  * @param record - Record to change.
  * @param from - Source id to replace.
  * @param to - Source id to use instead.
@@ -342,14 +344,19 @@ const remapInRecord = (record: InstallRecord, from: string, to: string, source: 
     return false;
   }
   let changed = false;
-  if (from !== to) {
-    for (const bundle of Object.values(record.bundles)) {
-      for (const entry of Object.values(bundle.tools)) {
-        if (entry.sourceId === from) {
-          entry.sourceId = to;
-        }
+  for (const bundle of Object.values(record.bundles)) {
+    for (const entry of Object.values(bundle.tools)) {
+      if (entry.sourceId !== from && entry.sourceId !== to) {
+        continue;
       }
+      if (entry.sourceId !== to || entry.sourceType !== source.type) {
+        changed = true;
+      }
+      entry.sourceId = to;
+      entry.sourceType = source.type;
     }
+  }
+  if (from !== to) {
     delete record.sources[from];
     changed = true;
   }
@@ -755,7 +762,10 @@ export class InstallRecordService {
    * The target file is saved first, then the file the entry left, which is
    * removed (with its `info/exclude` line, for the local-only file) when no
    * bundle is left. When the second save fails, both files hold the entry;
-   * the next `moveEntry` or `recordInstall` of it leaves one copy.
+   * the next `moveEntry` or `recordInstall` of it leaves one copy. The target
+   * file's entry for the same bundle and tool, and its `sources.<sourceId>`,
+   * are overwritten without comparing them: that is how an interrupted move
+   * is repaired.
    * @param input - The file holding the entry, the bundle id and the tool.
    * @returns The two files and the save warnings.
    * @throws {RegistryError} `RECORD.ENTRY_NOT_FOUND` when the file has no such
@@ -798,7 +808,8 @@ export class InstallRecordService {
    * Both files are loaded first, so a `RECORD.*` error on either stops the
    * remap with nothing saved. In each file `sources.<from>` becomes
    * `sources.<to>` with the descriptor's sanitized fields, and every entry
-   * whose `sourceId` is `from` takes `to`. The committed file is saved first,
+   * whose `sourceId` is `from` takes `to`, with the descriptor's type as its
+   * `sourceType`. The committed file is saved first,
    * then the local-only one, each only when it changed. Running it again is a
    * no-op, so a remap whose second save failed is repaired by the next one.
    * @param input - Root, the two ids and the source fields for `to`.
@@ -833,29 +844,40 @@ export class InstallRecordService {
   /**
    * One status row per (bundle, tool) entry of the given record files, sorted
    * by bundle, then tool, then record path (BR9.2). Every file is loaded and
-   * checked first; a missing file has no rows.
+   * checked first; a missing file has no rows. An entry in both repository
+   * files at one root (an interrupted `moveEntry`) is listed once, from the
+   * committed file.
    * @param locations - Record files to list, e.g. `RecordSelection.locations`.
    * @returns The rows.
    * @throws {RegistryError} Any `RECORD.*` error from loading a file.
    */
   public async listEntries(locations: readonly RecordLocation[]): Promise<StatusRow[]> {
-    const rows: StatusRow[] = [];
+    const rows = new Map<string, { row: StatusRow; committed: boolean }>();
     for (const location of locations) {
       const { record } = await this.store.load(location);
+      const committed = location.commitMode !== 'local-only';
       for (const [bundleId, bundle] of Object.entries(record.bundles)) {
         for (const [tool, entry] of Object.entries(bundle.tools)) {
-          rows.push({
-            bundleId,
-            tool,
-            level: location.level,
-            version: entry.version,
-            record: location.path,
-            needsReinstall: tool === UNKNOWN_TOOL_NAME || entry.needsReinstall === true
+          const key = JSON.stringify([location.level, location.root, bundleId, tool]);
+          const existing = rows.get(key);
+          if (existing !== undefined && (existing.committed || !committed)) {
+            continue;
+          }
+          rows.set(key, {
+            committed,
+            row: {
+              bundleId,
+              tool,
+              level: location.level,
+              version: entry.version,
+              record: location.path,
+              needsReinstall: tool === UNKNOWN_TOOL_NAME || entry.needsReinstall === true
+            }
           });
         }
       }
     }
-    return rows.toSorted((left, right) =>
+    return [...rows.values()].map(({ row }) => row).toSorted((left, right) =>
       compareText(left.bundleId, right.bundleId) || compareText(left.tool, right.tool) || compareText(left.record, right.record));
   }
 

@@ -41,10 +41,11 @@ const CONFIGURED_FIELDS = ['branch', 'collectionsPath', 'indexFile', 'authMode',
 const RECORD_FIELDS = ['branch', 'collectionsPath', 'indexFile'] as const;
 
 /**
- * Whether a source type reads a folder on disk, kept in its `url`.
+ * Whether a source type reads a folder on disk, kept in its `url`: `local`
+ * and every `local-*` type (for example `local-skills`).
  * @param type - Source type.
  */
-const isLocalType = (type: string): boolean => type === 'local' || type.startsWith('local-');
+export const isLocalType = (type: string): boolean => type === 'local' || type.startsWith('local-');
 
 const isInside = (realRoot: string, candidate: string): boolean => {
   const relative = path.relative(realRoot, candidate);
