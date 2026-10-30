@@ -44,10 +44,11 @@ export type SourceDecision =
 export const LOCAL_SOURCE_OUTSIDE_REASON = 'local source outside the repository';
 
 /**
- * Whether a source type reads a folder on disk, kept in its `url`.
+ * Whether a source type reads a folder on disk, kept in its `url`: `local`
+ * and every `local-*` type (for example `local-skills`).
  * @param type - Source type.
  */
-const isLocalType = (type: string): boolean => type === 'local' || type.startsWith('local-');
+export const isLocalType = (type: string): boolean => type === 'local' || type.startsWith('local-');
 
 /**
  * The record's copy without credentials, prototype-free.
