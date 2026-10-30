@@ -89,7 +89,6 @@ import {
 } from '../utils/bundle-identity-matcher';
 import {
   type CliManagedAction,
-  cliManagedError,
   isCliManagedError,
   showCliManagedBatchWarning,
 } from '../utils/cli-managed';
@@ -118,6 +117,9 @@ import {
 import {
   BundleInstaller,
 } from './bundle-installer';
+import {
+  ExtensionRecordAdapter,
+} from './extension-record-adapter';
 import {
   HubManager,
 } from './hub-manager';
@@ -237,6 +239,8 @@ export class RegistryManager {
   private hubManager?: HubManager;
   private _autoUpdateService?: AutoUpdateService;
   private readonly installer: BundleInstaller;
+  /** The extension's composition of the shared install record (U3). */
+  private readonly recordAdapter: ExtensionRecordAdapter;
   private readonly logger: Logger;
   private readonly adapters = new Map<string, IRepositoryAdapter>();
   private readonly versionConsolidator: VersionConsolidator;
@@ -301,7 +305,14 @@ export class RegistryManager {
       store: async () => undefined,
       delete: async () => undefined
     });
-    this.installer = new BundleInstaller(context);
+    // Sources an install records: the active hub's, then detached, then any stored one (NFR4.15).
+    this.recordAdapter = new ExtensionRecordAdapter({
+      sources: {
+        listSources: () => this.storage.getSources(),
+        getActiveHubId: async () => (await this.hubManager?.getActiveHubId()) ?? null
+      }
+    });
+    this.installer = new BundleInstaller(context, this.recordAdapter.hostTool, this.recordAdapter);
     this.logger = Logger.getInstance();
 
     // Initialize version consolidator with source type resolver
@@ -1087,8 +1098,7 @@ export class RegistryManager {
       {
         listSources: () => this.storage.getSources(),
         remapLockfileSourceId: workspaceRoot
-          ? (oldId, newId, descriptor) =>
-            LockfileManager.getInstance(workspaceRoot).remapSourceId(oldId, newId, descriptor)
+          ? (oldId, newId, descriptor) => this.recordAdapter.remapSource(workspaceRoot, oldId, newId, descriptor)
           : undefined,
         getInstalledBundles: (scope) => this.storage.getInstalledBundles(scope),
         // `core`'s `DeploymentManifest.mcpServers` is intentionally looser
@@ -1536,8 +1546,8 @@ export class RegistryManager {
    * @param silent
    */
   public async uninstallBundle(bundleId: string, scope: InstallationScope = 'user', silent = false): Promise<void> {
-    // CLI-installed repository items are refused before anything touches disk (BR5.6).
-    await this.assertNotCliManaged(bundleId, scope, 'uninstall');
+    // Entries only another tool holds are refused before anything touches disk (BR11.2).
+    await this.assertHostTool(bundleId, scope, 'uninstall');
     const installed = await uninstallInstalledBundle(
       bundleId,
       scope,
@@ -1548,9 +1558,8 @@ export class RegistryManager {
           if (!workspaceRoot) {
             throw new Error('Cannot uninstall repository-scoped bundle: no workspace is open');
           }
-          // Use getInstalledBundles() to search both main and local lockfiles
-          const lockfileManager = LockfileManager.getInstance(workspaceRoot);
-          return lockfileManager.getInstalledBundles();
+          // Install records merged with the old lockfiles (new record wins, BR5.1)
+          return this.listRepositoryBundles(workspaceRoot);
         },
         listSources: () => this.storage.getSources(),
         // `core`'s `DeploymentManifest.mcpServers` is intentionally looser
@@ -1627,8 +1636,13 @@ export class RegistryManager {
     // user-scope install with the same id is never refused (BR5.6).
     const target = (await this.listInstalledBundles()).find((bundle) => bundle.bundleId === bundleId);
     if (target) {
-      await this.assertNotCliManaged(bundleId, target.scope, 'update');
+      await this.assertHostTool(bundleId, target.scope, 'update');
     }
+    // A repository entry updates from the source `buildSource` decides: the
+    // active hub's, then detached, then any stored source with that id (NFR4.15).
+    const listSources = target?.scope === 'repository'
+      ? () => this.recordAdapter.configuredSources()
+      : () => this.storage.getSources();
     // See installBundle's identical, documented `as InstalledBundle` cast:
     // core's DeploymentManifest.mcpServers is intentionally looser than this
     // extension's McpServersManifest; the data itself is always this
@@ -1641,7 +1655,7 @@ export class RegistryManager {
         listInstalledBundles: () => this.listInstalledBundles(),
         checkLocalModifications: (id, current) => this.checkLocalModificationsBeforeUpdate(id, current as InstalledBundle),
         getBundleDetails: (id) => this.getBundleDetails(id),
-        listSources: () => this.storage.getSources(),
+        listSources,
         getAdapter: (source) => this.getAdapter(source),
         updateInstalledBundle: (current, bundle, buffer, sourceType) =>
           this.installer.update(current as InstalledBundle, bundle, buffer, sourceType),
@@ -1681,10 +1695,7 @@ export class RegistryManager {
         // the new record wins for the same bundle id (BR5.1). Read failures of
         // either store are reported or logged, never thrown.
         try {
-          return await this.getInstallRecordListing().listRepositoryBundles(
-            workspaceRoot,
-            () => LockfileManager.getInstance(workspaceRoot).getInstalledBundles()
-          );
+          return await this.listRepositoryBundles(workspaceRoot);
         } catch (error) {
           this.logger.warn('Failed to query repository bundles:', error instanceof Error ? error : undefined);
           return [];
@@ -1710,24 +1721,43 @@ export class RegistryManager {
   }
 
   /**
-   * Refuse an action on a repository item the ai-primitives-hub CLI installed
-   * (BR5.6, NFR4.3). Acts at repository scope only: user- and workspace-scope
-   * items are never refused, even when the same id is in a CLI record. The
-   * item is resolved from the merged repository listing, the view the user
-   * acted on, where the new record wins (BR5.1).
+   * The extension's composition of the shared install record (U3).
+   */
+  public getRecordAdapter(): ExtensionRecordAdapter {
+    return this.recordAdapter;
+  }
+
+  /**
+   * Repository bundles of a workspace folder: the install records merged with
+   * the old `prompt-registry` lockfiles, the new record winning (BR5.1).
+   * @param workspaceRoot - Workspace folder.
+   * @returns One item per bundle id.
+   */
+  public listRepositoryBundles(workspaceRoot: string): Promise<InstalledBundle[]> {
+    return this.getInstallRecordListing().listRepositoryBundles(
+      workspaceRoot,
+      () => this.recordAdapter.listOldBundles(workspaceRoot)
+    );
+  }
+
+  /**
+   * Refuse an action on a repository bundle whose record entries all belong
+   * to another tool (BR11.2, NFR4.12). Acts at repository scope only: user-
+   * and workspace-scope items are never refused. Old-file rows are the host's own.
    * @param bundleId - Bundle the action targets.
    * @param scope - Scope of the exact item the action works on.
    * @param action - The action, for the message.
-   * @throws {RegistryError} `RECORD.CLI_MANAGED` when the item comes from an install record.
+   * @throws {RegistryError} `RECORD.CLI_MANAGED` naming the entry's tool; any `RECORD.*` error from loading.
    */
-  public async assertNotCliManaged(bundleId: string, scope: InstallationScope, action: CliManagedAction): Promise<void> {
+  public async assertHostTool(bundleId: string, scope: InstallationScope, action: CliManagedAction): Promise<void> {
     if (scope !== 'repository') {
       return;
     }
-    const item = (await this.listInstalledBundles('repository')).find((bundle) => bundle.bundleId === bundleId);
-    if (item?.recordOrigin === 'install-record') {
-      throw cliManagedError(bundleId, action);
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) {
+      return;
     }
+    await this.recordAdapter.assertHostTool(bundleId, action, workspaceRoot);
   }
 
   /**

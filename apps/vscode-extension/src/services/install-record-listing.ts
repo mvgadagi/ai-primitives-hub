@@ -48,15 +48,18 @@ import {
   createInstalledBundleFromLockfile,
 } from './lockfile-manager';
 
+/** Marketplace id of this extension (`<publisher>.<name>`, ADR-0004: unchanged). */
+export const EXTENSION_ID = 'AmadeusITGroup.prompt-registry';
+
 /**
  * Writer stamp for records the extension writes (`generatedBy`), from the
- * same version source `LockfileManager` uses.
+ * running extension's `package.json` version.
  * @returns `ai-primitives-hub-extension@<version>`.
  */
 export const getExtensionRecordGeneratedBy = (): string => {
   let extensionVersion = '0.0.0';
   try {
-    const extension = vscode.extensions.getExtension('prompt-registry');
+    const extension = vscode.extensions.getExtension(EXTENSION_ID);
     if (extension) {
       const { version } = extension.packageJSON as { version?: string };
       extensionVersion = version || '0.0.0';
