@@ -373,6 +373,18 @@ export class BundleInstaller {
   }
 
   /**
+   * Whether an entry of the user record, of any tool, lists a file under a folder (BR16.x).
+   * @param location - The user record location.
+   * @param folder - Absolute folder under the record root.
+   * @throws {RegistryError} Any `RECORD.*` error from loading, after it was shown once.
+   */
+  private async userRecordListsUnder(location: RecordLocation, folder: string): Promise<boolean> {
+    const prefix = `${path.relative(location.root, folder).split(path.sep).join('/')}/`;
+    const listed = await this.records.listedPathsIn(location).catch((error: unknown) => this.rethrowRecordError(error, [], location.root));
+    return [...listed].some((file) => file.startsWith(prefix));
+  }
+
+  /**
    * Retire the profile's RegistryStorage user installation of a bundle
    * (BR16.x): unsync its files except those the user record lists, then
    * remove the installation.
@@ -988,9 +1000,10 @@ export class BundleInstaller {
           }
 
           // Check for existing skill using checkPathExists to detect broken symlinks.
-          // A user update in place writes over its own skill folder (BR16.x): no prompt, no removal.
+          // A user install writes over a skill folder the user record lists, for any tool or profile (BR16.x):
+          // no prompt, no removal; superseded-file deletion keeps any file an entry still lists.
           const existingEntry = await checkPathExists(installDir);
-          if (existingEntry.exists && !(user && inPlace)) {
+          if (existingEntry.exists && !(user && (inPlace || await this.userRecordListsUnder(user.location, installDir)))) {
             // For broken symlinks, we can safely remove without prompting
             if (existingEntry.isBroken) {
               await fs.promises.unlink(installDir);
