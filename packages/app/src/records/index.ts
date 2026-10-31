@@ -15,4 +15,5 @@ export * from './resolve-record-source';
 export * from './sanitize-source';
 export * from './select-record';
 export * from './serialize-record';
+export * from './user-home';
 export * from './writer-group';
