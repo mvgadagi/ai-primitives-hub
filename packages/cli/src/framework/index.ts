@@ -110,6 +110,8 @@ export {
   recordOutputFields,
   recordRepositoryInstall,
   recordRepositoryUninstall,
+  recordUnknownUninstall,
+  renderMigration,
   renderRecordLine,
   toCommandRecordError,
   toInstallRecordError,

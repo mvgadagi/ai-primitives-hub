@@ -94,6 +94,7 @@ interface JsonEnvelope<T> {
 /** The 3.0.0 install record shape the assertions read. */
 interface InstallRecord {
   bundles: Record<string, { tools: Record<string, { files: { path: string }[] }> }>;
+  importedUserLockfileAt?: string;
 }
 interface InstallData {
   written: string[];
@@ -199,7 +200,8 @@ describe('install --skip-unsupported', () => {
       expect(result.stdout).toContain('BUNDLE.UNSUPPORTED_CONTENT');
       expect(result.stdout).toContain('hooks/pre-commit.hook.json');
       expect(await listFiles(kiroDir)).toEqual([]);
-      await expect(readFile(userRecordPath(), 'utf8')).rejects.toThrow();
+      // Only the user-level import ran before the refusal: no bundle is recorded.
+      expect((await readRecord(userRecordPath())).bundles).toEqual({});
     });
 
     it('keeps the JSON envelope of a fully supported install', async () => {
@@ -267,8 +269,8 @@ describe('install --skip-unsupported', () => {
     expect(removed.exitCode, removed.stdout).toBe(0);
     expect(parseJson<{ removed: string[] }>(removed.stdout).data.removed).toEqual(['.kiro/steering/hello.prompt.md']);
     expect(await listFiles(kiroDir)).toEqual([]);
-    // The user record held only this entry, so it is removed with it.
-    await expect(readFile(userRecordPath(), 'utf8')).rejects.toThrow();
+    // The user record is kept empty, with its import marker (BR20.1).
+    expect(await readRecord(userRecordPath())).toMatchObject({ bundles: {}, importedUserLockfileAt: expect.any(String) });
   });
 
   it('applies to a remote install', async () => {
@@ -345,6 +347,7 @@ describe('install --skip-unsupported', () => {
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain('BUNDLE.UNSUPPORTED_CONTENT');
     expect(await listFiles(kiroDir)).toEqual([]);
-    await expect(readFile(userRecordPath(), 'utf8')).rejects.toThrow();
+    // Only the user-level import ran before the refusal: no bundle is recorded.
+    expect((await readRecord(userRecordPath())).bundles).toEqual({});
   });
 });
