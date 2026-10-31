@@ -9,8 +9,10 @@
  * by today's upward walk, and the user level otherwise. Every repository
  * record file selected is loaded through the `RecordStore` before this
  * returns, so a hostile or malformed record stops the command with a
- * `RECORD.*` error before anything is written. The user level keeps the old
- * user lockfile until U4.
+ * `RECORD.*` error before anything is written. With the shared user record
+ * and home passed in, the user level selects that record (rooted at home)
+ * and keeps the old user lockfile as its old store (BR15.1); workspace scope
+ * keeps the old user lockfile only (RQ4).
  * @module records/select-record
  */
 import * as path from 'node:path';
@@ -38,7 +40,7 @@ export type RecordSelectionReason =
 export interface RecordSelection {
   /** Level of every selected file. */
   level: RecordLevel;
-  /** Level root: the git root (or the `--lockfile` folder) at repository level, the user lockfile's folder at user level. */
+  /** Level root: the git root (or the `--lockfile` folder) at repository level; the home folder for the shared user record, else the user lockfile's folder. */
   root: string;
   /**
    * New 3.0.0 record files, loaded and checked: both repository files at the
@@ -83,6 +85,14 @@ export interface SelectRecordOptions {
   findOldLockfile: (start: string) => Promise<string | null>;
   /** Absolute path of the user lockfile (`resolveUserConfigPaths(env).userLockfile`). */
   userLockfile: string;
+  /**
+   * The shared 3.0.0 user record (`AppStoragePaths.userRecord`, BR14.1). With
+   * {@link home}, the user level selects it (BR15.1); without, the user level
+   * keeps the old user lockfile only.
+   */
+  userRecord?: string;
+  /** Home folder from `resolveUserHome`; the user level's root (BR14.3). */
+  home?: string;
 }
 
 /**
@@ -102,6 +112,38 @@ const userSelection = (userLockfile: string, reason: RecordSelectionReason, infe
   inferred,
   reason
 });
+
+/**
+ * User selection on the shared user record (BR15.1): the loaded user
+ * location, rooted at home, with the old user lockfile as old store when it
+ * exists. Falls back to the old-only selection when the caller did not pass
+ * the user record and home, and for workspace scope (RQ4).
+ * @param options - Selection inputs.
+ * @param reason - Why the user level was picked.
+ * @param inferred - Whether the level was inferred.
+ * @param scope - The given or target scope, when there is one.
+ */
+const sharedUserSelection = async (
+  options: SelectRecordOptions,
+  reason: RecordSelectionReason,
+  inferred: boolean,
+  scope?: InstallationScope
+): Promise<RecordSelection> => {
+  if (options.userRecord === undefined || options.home === undefined || scope === 'workspace') {
+    return userSelection(options.userLockfile, reason, inferred);
+  }
+  const location = options.store.resolveUser({ home: options.home, path: options.userRecord });
+  await options.store.load(location);
+  const oldExists = await options.fs.exists(options.userLockfile);
+  return {
+    level: 'user',
+    root: location.root,
+    locations: [location],
+    ...(oldExists ? { oldLockfile: options.userLockfile } : {}),
+    inferred,
+    reason
+  };
+};
 
 /**
  * The old repository file found from `start`, ignoring the user lockfile the walk may fall back to.
@@ -153,6 +195,9 @@ const lockfileSelection = async (options: SelectRecordOptions, lockfile: string)
   if (absolute === path.resolve(options.userLockfile)) {
     return userSelection(options.userLockfile, 'lockfile-flag', false);
   }
+  if (options.userRecord !== undefined && absolute === path.resolve(options.userRecord)) {
+    return sharedUserSelection(options, 'lockfile-flag', false);
+  }
   const root = path.dirname(absolute);
   const name = path.basename(absolute);
   if (!(RECORD_FILE_NAMES as readonly string[]).includes(name)) {
@@ -183,12 +228,12 @@ export const selectRecord = async (options: SelectRecordOptions): Promise<Record
   if (given?.scope !== undefined) {
     return recordLevelForScope(given.scope) === 'repository'
       ? repositorySelection(options, start, 'explicit-scope')
-      : userSelection(options.userLockfile, 'explicit-scope', false);
+      : sharedUserSelection(options, 'explicit-scope', false, given.scope);
   }
   if (given?.target !== undefined) {
     return recordLevelForScope(given.target.scope) === 'repository'
       ? repositorySelection(options, start, 'target-scope')
-      : userSelection(options.userLockfile, 'target-scope', false);
+      : sharedUserSelection(options, 'target-scope', false, given.target.scope);
   }
   const [committed, localOnly] = await options.store.resolveRepository({ start: path.resolve(cwd) });
   const hasNewRecord = (await options.fs.exists(committed.path)) || (await options.fs.exists(localOnly.path));
@@ -196,5 +241,5 @@ export const selectRecord = async (options: SelectRecordOptions): Promise<Record
   if (hasNewRecord || old !== undefined) {
     return repositorySelection(options, path.resolve(cwd), 'repository-record-found', old);
   }
-  return userSelection(options.userLockfile, 'user-fallback', true);
+  return sharedUserSelection(options, 'user-fallback', true);
 };
