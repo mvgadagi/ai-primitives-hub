@@ -16,6 +16,7 @@ import {
   type Lockfile,
   type LockfileBundleEntry,
   type LockfileSourceEntry,
+  type MigrationReport,
   planRecordEntries,
   readLockfile,
   type RecordInstallResult,
@@ -96,6 +97,7 @@ import {
   recordOutputFields,
   recordPlannedInstall,
   RegistryError,
+  renderMigration,
   renderRecordLine,
   resolveEffectiveTarget,
   resolveTarget,
@@ -260,8 +262,9 @@ export class UpdateCommand extends BaseUpdateCommand {
       const target = resolveEffectiveTarget(ctx, configuredTarget, opts);
 
       // Select the record first: every selected file is loaded and checked
-      // before anything is fetched or written (W5 step 1, NFR4.8).
-      const prepared = await prepareRecordSelection(ctx, { command: 'update', lockfile: this.lockfile, scope: opts.scope }, target);
+      // before anything is fetched or written (W5 step 1, NFR4.8). A real
+      // update migrates the selected level first; a dry run never does (BR18.1).
+      const prepared = await prepareRecordSelection(ctx, { command: 'update', lockfile: this.lockfile, scope: opts.scope, write: this.dryRun !== true }, target);
       if (prepared.selection.locations.length > 0) {
         const rows = await prepared.service.listEntries(prepared.selection.locations);
         if (rows.length > 0) {
@@ -800,6 +803,8 @@ interface RecordUpdateData {
   failures: string[];
   /** Bundles only in the old `prompt-registry.*` file, handled with today's code (BR10.1). */
   oldFile?: OldFileUpdate;
+  /** What the migration run before the update did (BR22.1). */
+  migration?: MigrationReport;
 }
 
 /** What {@link updateOldFileOnly} reports for the old `prompt-registry.*` file. */
@@ -967,7 +972,7 @@ function renderRecordUpdateOutput(d: RecordUpdateData & { recordLine: string }):
   if (d.dryRun === true && updateLines.length > 0) {
     lines.push('Re-run without --dry-run to apply.');
   }
-  return lines.join('\n') + '\n' + d.recordLine;
+  return lines.join('\n') + '\n' + renderMigration(d.migration) + d.recordLine;
 }
 
 /**
@@ -997,7 +1002,8 @@ async function updateFromRecord(run: RecordUpdateRun): Promise<number> {
     updates: [],
     alsoUpdated: [],
     skipped,
-    failures
+    failures,
+    ...(prepared.migration === undefined ? {} : { migration: prepared.migration })
   };
   const warnings = [...notes];
   if (run.dryRun) {
