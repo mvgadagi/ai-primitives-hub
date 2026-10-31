@@ -1461,5 +1461,23 @@ agents:
       expect(Object.keys((await readReplayRecord()).bundles['old-only'].tools)).toEqual(['unknown']);
       expect(await exists(oldPath)).toBe(false);
     });
+
+    it('bare install --dry-run with only prompt-registry.lock.json is refused and writes nothing (R-07)', async () => {
+      await rm(recordPath());
+      const oldPath = path.join(workspace, 'prompt-registry.lock.json');
+      const oldBytes = JSON.stringify({
+        version: '2.0.0', generatedAt: '2026-10-01T00:00:00.000Z', generatedBy: 'test',
+        bundles: { 'old-only': { version: '0.1.0', sourceId: 'old-src', sourceType: 'local', installedAt: '2026-10-01T00:00:00.000Z', files: [] } },
+        sources: { 'old-src': { type: 'local', url: path.join(workspace, 'old-bundle') } }
+      });
+      await writeFile(oldPath, oldBytes);
+
+      const result = await run(['install', '--dry-run', '-o', 'json']);
+
+      expect(result.exitCode, result.stdout).not.toBe(0);
+      expect(result.stdout).toContain('USAGE.INVALID_FLAG');
+      expect(await readFile(oldPath, 'utf8')).toBe(oldBytes);
+      expect(await exists(recordPath())).toBe(false);
+    });
   });
 });
