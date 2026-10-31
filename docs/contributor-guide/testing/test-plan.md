@@ -587,7 +587,7 @@ Almost entirely manual by nature — it involves real registries and real releas
 | 19.2 | Review user guide pages for every changed behaviour | Updated to match the shipped build | 🔴 Editorial judgement |
 | 19.3 | `pnpm -C website run build` | Clean build; new pages registered in `docs/README.md` and `website/sidebars.ts` | 🟢 Enforced by the `docs.yml` workflow |
 | 19.4 | Read the release notes end to end | Every breaking change listed with a migration note | 🔴 Editorial judgement |
-| 19.5 | Check version references in `README.md` | Updated by `version:bump:major` | 🟡 `version:update` rewrites them. **Nothing verifies the result** |
+| 19.5 | Check that core, infra, app, cli, the extension and the scaffold CLI range share one version | Equal after every release | 🟢 `scripts/check-versions.mjs` in the CI `version-check` job |
 | 19.6 | Regenerate helper skill references via `copy-skill-references` | Reflect the current `docs/` tree | 🔴 **Nothing detects a stale generated index** |
 
 ---
