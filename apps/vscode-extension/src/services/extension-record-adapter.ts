@@ -16,44 +16,47 @@
  * - the user record (BR16.x): its location under the home folder, the
  *   pre-write home check of the user target folders, the other-tool refusal
  *   and the profile-retirement order (unsync, then remove the installation);
- * - the old `prompt-registry.lock.json` files, read and changed through
- *   app's `json-lockfile-store` (listing, retirement, source remap).
+ * - `migrateBeforeWrite` (U5; BR18.1, BR18.2, BR20.2, BR22.2): app's
+ *   `migrateRecords` for a level before an action's first record change, with
+ *   this profile's RegistryStorage user installs as host-tool entries, and the
+ *   report shown once;
+ * - the old `prompt-registry.lock.json` files at the record root, read only
+ *   (listing and the local-modification check); writes migrate them first.
  * @module services/extension-record-adapter
  */
 import * as path from 'node:path';
 import {
   assertUserFolderInsideHome,
-  cleanupOrphanedSource,
-  deleteLockfile,
-  emptyLockfile,
-  findModifiedFiles,
   getLockfilePathForMode,
   InstallRecordService,
   type Lockfile,
   type LockfileBundleEntry,
   type LockfileFs,
+  type MigratedEntry,
+  migrateRecords,
+  type MigrationReport,
   readLockfile,
   RECORD_SOURCE_TYPES,
   type RecordSourceDescriptor,
   type RecordSourceInput,
   RecordStore,
-  remapSourceId,
-  removeBundleEntry,
+  resolveUserConfigPaths,
   resolveUserHome,
-  upsertBundleEntry,
-  upsertSource,
-  writeLockfile,
 } from '@ai-primitives-hub/app';
 import {
   DEFAULT_LOCAL_HUB_ID,
   isRecordError,
   type LockfileSourceDescriptor,
+  RECORD_NAME_PATTERN,
   recordError,
   type RecordFs,
+  type RecordLevel,
   type RecordLocation,
+  type RegistryError,
   type RegistrySource,
   type TargetType,
   type ToolEntry,
+  UNKNOWN_TOOL_NAME,
 } from '@ai-primitives-hub/core';
 import {
   NodeRecordFs,
@@ -108,9 +111,32 @@ export interface ExtensionRecordAdapterOptions {
   hostTool?: TargetType;
   /** Absolute user record path (`AppStoragePaths.userRecord`); the user record is not used without it. */
   userRecordPath?: string;
-  /** Environment for the home folder (`resolveUserHome`); `process.env` by default. */
+  /** Environment for the home folder (`resolveUserHome`) and the CLI's old user lockfile; `process.env` by default. */
   env?: Record<string, string | undefined>;
+  /** This profile's RegistryStorage user installs, migrated at user level outside WSL (BR20.2); none without it. */
+  profileStore?: ProfileStorePort;
+  /** Where shown migration reports are remembered (BR22.2): the extension's `globalState`; in memory without it. */
+  memento?: Pick<vscode.Memento, 'get' | 'update'>;
 }
+
+/** This profile's RegistryStorage user installs, as user-level migration reads and retires them (BR20.2). */
+export interface ProfileStorePort {
+  /** RegistryStorage installs with scope `user` (`RegistryStorage.getInstalledBundles('user')`). */
+  getInstalledBundles(): Promise<InstalledBundle[]>;
+  /** Absolute user files the profile synced for a bundle (`UserScopeService.syncedTargetPaths`). */
+  syncedTargetPaths(bundleId: string): Promise<string[]>;
+  /** Removes the RegistryStorage install without touching its files (`RegistryStorage.removeInstallation`). */
+  removeInstallation(bundleId: string): Promise<void>;
+}
+
+/** Prefix of the globalState key remembering a shown migration report (BR22.2). */
+export const MIGRATION_SHOWN_KEY_PREFIX = 'aiPrimitivesHub.migrationShown';
+
+/** Prefix of the log line holding a migration report. */
+export const MIGRATION_LOG_PREFIX = 'Install record migration';
+
+/** Button of the migration notification that opens the output channel. */
+const SHOW_DETAILS = 'Show details';
 
 /** One tool entry of a bundle, with the record file holding it. */
 export interface LocatedToolEntry {
@@ -140,15 +166,43 @@ export interface OldBundleEntry {
   entry: LockfileBundleEntry;
 }
 
-/** Outcome of {@link ExtensionRecordAdapter.retireOldEntry}. */
-export interface RetiredOldEntry {
-  /** Workspace-relative files removed. */
-  deleted: string[];
-  /** Workspace-relative files kept: listed by another entry, or modified. */
-  kept: string[];
-  /** Non-fatal problems, for the caller to log. */
-  warnings: string[];
-}
+/**
+ * The refusal of a move or commit-mode switch of a bundle whose only entry is
+ * `unknown` (BR21.4): its files cannot be moved for a tool nobody knows.
+ * @param bundleId - Refused bundle.
+ * @param action - Refused action.
+ * @returns A `RECORD.CLI_MANAGED` error, so callers show it as the other refusals.
+ */
+const unknownToolError = (bundleId: string, action: CliManagedAction): RegistryError =>
+  recordError('RECORD.CLI_MANAGED', {
+    message: `${bundleId} was migrated and its tool is unknown; reinstall it first`,
+    hint: '',
+    context: { bundleId, action, tool: UNKNOWN_TOOL_NAME }
+  });
+
+/**
+ * Whether a report records anything besides the user record's import marker.
+ * @param report
+ */
+const hasMigrated = (report: MigrationReport): boolean =>
+  [report.renamed, report.mergedFrom, report.needsReinstall, report.versionConflicts, report.droppedFiles, report.droppedEntries]
+    .some((list) => list.length > 0);
+
+/**
+ * The notification text of a migration report (BR22.2).
+ * @param report - The report.
+ */
+const migrationMessage = (report: MigrationReport): string => {
+  const count = report.needsReinstall.length;
+  if (count > 0) {
+    return `Migrated the ${report.level} install record: ${count} bundle${count === 1 ? ' needs' : 's need'} reinstalling.`;
+  }
+  const done = [
+    ...report.renamed.map((renamed) => `renamed ${path.basename(renamed.from)} to ${path.basename(renamed.to)}`),
+    ...report.mergedFrom.map((merged) => `merged ${path.isAbsolute(merged) ? path.basename(merged) : merged}`)
+  ];
+  return `Migrated the ${report.level} install record${done.length === 0 ? '.' : `: ${done.join(', ')}.`}`;
+};
 
 /**
  * Forward-slash form of a recorded path.
@@ -199,6 +253,11 @@ export class ExtensionRecordAdapter {
   /** The user level's home folder; the root of every user record path (BR14.3). */
   public readonly home: string;
   private readonly userRecordPath: string | undefined;
+  private readonly env: Record<string, string | undefined>;
+  private readonly profileStore: ProfileStorePort | undefined;
+  private readonly memento: Pick<vscode.Memento, 'get' | 'update'> | undefined;
+  /** Shown migration reports when no memento is given. */
+  private readonly shownMigrations = new Set<string>();
   private loggedWslUserRecord = false;
   /** Tail of the job chain of each record file, by resolved path; see {@link serialize}. */
   private readonly recordQueues = new Map<string, Promise<unknown>>();
@@ -210,8 +269,11 @@ export class ExtensionRecordAdapter {
     this.hostTool = options.hostTool ?? detectHostApp();
     this.sources = options.sources;
     this.lockfileFs = new RecordLockfileFs(this.fs);
-    this.home = resolveUserHome(options.env ?? process.env);
+    this.env = options.env ?? process.env;
+    this.home = resolveUserHome(this.env);
     this.userRecordPath = options.userRecordPath;
+    this.profileStore = options.profileStore;
+    this.memento = options.memento;
   }
 
   /**
@@ -233,14 +295,89 @@ export class ExtensionRecordAdapter {
   }
 
   /**
-   * Save an old lockfile, or delete it when it has no bundle left.
-   * @param file - Absolute old lockfile path.
-   * @param lock - Content to save.
+   * Whether an action may run on a bundle with these entry tools; a lone
+   * `unknown` entry is refused here for a move or switch (BR21.4).
+   * @param bundleId - Bundle the action targets.
+   * @param action - The action.
+   * @param tools - Tools of the bundle's entries at the level.
+   * @returns `false` when another tool's refusal applies.
+   * @throws {RegistryError} The reinstall hint for a move or switch of a lone `unknown` entry.
    */
-  private async saveOldLockfile(file: string, lock: Lockfile): Promise<void> {
-    await (Object.keys(lock.bundles).length === 0
-      ? deleteLockfile(file, this.lockfileFs)
-      : writeLockfile(file, lock, this.lockfileFs));
+  private isAllowed(bundleId: string, action: CliManagedAction, tools: readonly string[]): boolean {
+    if (tools.length === 0 || tools.includes(this.hostTool)) {
+      return true;
+    }
+    if (tools.length === 1 && tools[0] === UNKNOWN_TOOL_NAME) {
+      if (action === 'update' || action === 'uninstall') {
+        return true;
+      }
+      throw unknownToolError(bundleId, action);
+    }
+    return false;
+  }
+
+  /**
+   * This profile's RegistryStorage user installs as host-tool entries (BR20.2):
+   * the files the profile synced, home-relative, and the configured source
+   * when there is one. Linked `local-skills` installs stay in RegistryStorage
+   * (their files follow the source folder), and so does an install with no
+   * source id or source type.
+   */
+  private async buildProfileEntries(): Promise<MigratedEntry[]> {
+    const entries: MigratedEntry[] = [];
+    for (const installed of await this.profileStore?.getInstalledBundles() ?? []) {
+      if (installed.sourceType === 'local-skills') {
+        continue;
+      }
+      let source: RecordSourceInput | undefined;
+      try {
+        source = await this.buildSource(installed.sourceId);
+      } catch {
+        // Not a configured source: the entry keeps its id and type only.
+      }
+      const sourceType = installed.sourceType ?? source?.type;
+      if (installed.sourceId === undefined || sourceType === undefined || !RECORD_NAME_PATTERN.test(sourceType)) {
+        this.logger.warn(`Not migrating the profile install of ${installed.bundleId}: it records no source id or source type`);
+        continue;
+      }
+      const files = (await this.profileStore?.syncedTargetPaths(installed.bundleId) ?? [])
+        .map((file) => ({ path: toSlashes(path.relative(this.home, file)) }));
+      const { sourceId: _sourceId, ...recordedSource } = source ?? { sourceId: '' };
+      entries.push({
+        bundleId: installed.bundleId,
+        tool: this.hostTool,
+        version: installed.version,
+        sourceId: installed.sourceId,
+        sourceType,
+        installedAt: installed.installedAt,
+        files,
+        source: source === undefined ? undefined : recordedSource,
+        from: 'profile-registry-storage'
+      });
+    }
+    return entries;
+  }
+
+  /**
+   * Remove migrated profile installs from RegistryStorage, files untouched
+   * (BR20.2). Failures are logged and shown in one warning.
+   * @param bundleIds - Bundles to remove.
+   */
+  private async retireProfileInstalls(bundleIds: readonly string[]): Promise<void> {
+    const failed: string[] = [];
+    for (const bundleId of bundleIds) {
+      try {
+        await this.profileStore?.removeInstallation(bundleId);
+      } catch (error) {
+        failed.push(bundleId);
+        this.logger.error(`Could not remove the migrated profile install of ${bundleId}`, error instanceof Error ? error : undefined);
+      }
+    }
+    if (failed.length > 0) {
+      void vscode.window.showWarningMessage(
+        `Migrated the user install record, but could not remove the old profile entries of ${failed.join(', ')}. They are removed on the next change.`
+      );
+    }
   }
 
   /**
@@ -267,14 +404,16 @@ export class ExtensionRecordAdapter {
   }
 
   /**
-   * Both old `prompt-registry` lockfiles of a workspace folder, committed first.
-   * An unreadable file is logged and given as `lock: null`.
-   * @param workspaceFolder - Absolute workspace folder path (where the old files live).
+   * Both old `prompt-registry` lockfiles at the record root of a workspace
+   * folder (its git root), committed first. Old files anywhere else are
+   * ignored. An unreadable file is logged and given as `lock: null`.
+   * @param workspaceFolder - Absolute workspace folder path.
    */
   public async readOldLockfiles(workspaceFolder: string): Promise<OldLockfile[]> {
+    const root = await this.resolveRoot(workspaceFolder);
     const files: OldLockfile[] = [];
     for (const commitMode of ['commit', 'local-only'] as const) {
-      const file = getLockfilePathForMode(workspaceFolder, commitMode);
+      const file = getLockfilePathForMode(root, commitMode);
       let lock: Lockfile | null = null;
       try {
         lock = await readLockfile(file, this.lockfileFs);
@@ -384,15 +523,17 @@ export class ExtensionRecordAdapter {
   /**
    * Refuse an action on a bundle whose record entries all belong to another
    * tool (BR11.2, NFR4.12). A bundle with a host-tool entry, or with no record
-   * entry (old-file rows have no tool and are the host's own), is allowed.
+   * entry, is allowed. A bundle whose only entry is `unknown` (migrated, BR21.4)
+   * is allowed for update and uninstall, and refused for a move or a
+   * commit-mode switch with a reinstall hint.
    * @param bundleId - Bundle the action targets.
    * @param action - The action, for the message.
    * @param workspaceFolder - Absolute workspace folder path.
-   * @throws {RegistryError} `RECORD.CLI_MANAGED` naming the tool; any `RECORD.*` error from loading.
+   * @throws {RegistryError} `RECORD.CLI_MANAGED` naming the tool, or the reinstall hint; any `RECORD.*` error from loading.
    */
   public async assertHostTool(bundleId: string, action: CliManagedAction, workspaceFolder: string): Promise<void> {
     const tools = (await this.findEntries(workspaceFolder, bundleId)).map((located) => located.tool);
-    if (tools.length === 0 || tools.includes(this.hostTool)) {
+    if (this.isAllowed(bundleId, action, tools)) {
       return;
     }
     throw cliManagedError(bundleId, action, tools.toSorted()[0]);
@@ -482,14 +623,15 @@ export class ExtensionRecordAdapter {
   /**
    * Refuse an action on a user-level bundle whose user record entries all
    * belong to another tool (BR11.2, NFR4.12 at user level). A bundle with a
-   * host-tool entry, or with no user record entry, is allowed.
+   * host-tool entry, or with no user record entry, is allowed; a lone
+   * `unknown` entry as in {@link assertHostTool} (BR21.4).
    * @param bundleId - Bundle the action targets.
    * @param action - The action, for the message.
-   * @throws {RegistryError} `RECORD.CLI_MANAGED` naming the tool and "a <tool> user target"; any `RECORD.*` error from loading.
+   * @throws {RegistryError} `RECORD.CLI_MANAGED` naming the tool and "a <tool> user target", or the reinstall hint; any `RECORD.*` error from loading.
    */
   public async assertUserHostTool(bundleId: string, action: CliManagedAction): Promise<void> {
     const tools = (await this.findUserEntries(bundleId)).map((located) => located.tool);
-    if (tools.length === 0 || tools.includes(this.hostTool)) {
+    if (this.isAllowed(bundleId, action, tools)) {
       return;
     }
     const tool = tools.toSorted()[0];
@@ -608,13 +750,14 @@ export class ExtensionRecordAdapter {
   }
 
   /**
-   * Bundles of the old `prompt-registry` lockfiles, as listing items. A bundle
-   * in both old files is listed once, from the committed file.
+   * Bundles of the old `prompt-registry` lockfiles at the record root, as
+   * listing items. A bundle in both old files is listed once, from the committed file.
    * @param workspaceFolder - Absolute workspace folder path.
    */
   public async listOldBundles(workspaceFolder: string): Promise<InstalledBundle[]> {
     const bundles: InstalledBundle[] = [];
     const seen = new Set<string>();
+    const root = await this.resolveRoot(workspaceFolder);
     for (const old of await this.readOldLockfiles(workspaceFolder)) {
       for (const [bundleId, entry] of Object.entries(old.lock?.bundles ?? {})) {
         if (seen.has(bundleId)) {
@@ -623,8 +766,8 @@ export class ExtensionRecordAdapter {
         }
         seen.add(bundleId);
         bundles.push(createInstalledBundleFromLockfile(bundleId, entry, {
-          installPath: path.join(workspaceFolder, '.github'),
-          filesMissing: await this.anyMissing(workspaceFolder, entry.files.map((file) => toSlashes(file.path))),
+          installPath: path.join(root, '.github'),
+          filesMissing: await this.anyMissing(root, entry.files.map((file) => toSlashes(file.path))),
           commitModeOverride: old.commitMode
         }));
       }
@@ -647,101 +790,14 @@ export class ExtensionRecordAdapter {
   }
 
   /**
-   * Remove a bundle's entry from the old lockfile holding it, without touching
-   * any installed file (stale cleanup, BR12.2). Its source is dropped when no
-   * other entry uses it.
-   * @param workspaceFolder - Absolute workspace folder path.
-   * @param bundleId - Bundle id.
-   * @returns Whether an entry was removed.
-   */
-  public async removeOldEntry(workspaceFolder: string, bundleId: string): Promise<boolean> {
-    const found = await this.findOldEntry(workspaceFolder, bundleId);
-    if (found === undefined) {
-      return false;
-    }
-    const updated = cleanupOrphanedSource(removeBundleEntry(found.old.lock, bundleId), found.entry.sourceId);
-    await this.saveOldLockfile(found.old.path, updated);
-    return true;
-  }
-
-  /**
-   * Move an old-file-only bundle's entry, with its source, to the old lockfile
-   * of the other commit mode (today's behaviour for bundles never rewritten).
-   * The target file is saved first, then the entry leaves the first file.
-   * @param workspaceFolder - Absolute workspace folder path.
-   * @param bundleId - Bundle id.
-   * @param commitMode - Commit mode to move to.
-   * @returns Whether an entry was moved.
-   */
-  public async moveOldEntry(workspaceFolder: string, bundleId: string, commitMode: RepositoryCommitMode): Promise<boolean> {
-    const found = await this.findOldEntry(workspaceFolder, bundleId);
-    if (found === undefined || found.old.commitMode === commitMode) {
-      return false;
-    }
-    const targetPath = getLockfilePathForMode(workspaceFolder, commitMode);
-    const target = (await readLockfile(targetPath, this.lockfileFs)) ?? emptyLockfile(found.old.lock.generatedBy);
-    const { commitMode: _deprecated, ...entry } = found.entry;
-    let moved = upsertBundleEntry(target, bundleId, entry);
-    const source = found.old.lock.sources[found.entry.sourceId];
-    if (source !== undefined) {
-      moved = upsertSource(moved, found.entry.sourceId, source);
-    }
-    await writeLockfile(targetPath, moved, this.lockfileFs);
-    await this.saveOldLockfile(found.old.path, cleanupOrphanedSource(removeBundleEntry(found.old.lock, bundleId), found.entry.sourceId));
-    return true;
-  }
-
-  /**
-   * Remove a bundle's entry from the old `prompt-registry` lockfiles and
-   * delete its files (BR12.1; the old-only uninstall). A file another old
-   * entry or any record entry lists, or that was modified, is kept. The old
-   * file is saved first (removed when empty), then files are deleted.
-   * @param workspaceFolder - Absolute workspace folder path.
-   * @param bundleId - Bundle id.
-   * @returns What was deleted and kept, or `undefined` when no old file has the bundle.
-   * @throws {RegistryError} Any `RECORD.*` error from loading the record files.
-   */
-  public async retireOldEntry(workspaceFolder: string, bundleId: string): Promise<RetiredOldEntry | undefined> {
-    const olds = await this.readOldLockfiles(workspaceFolder);
-    const holder = olds.find((old) => old.lock !== null && Object.hasOwn(old.lock.bundles, bundleId));
-    if (holder?.lock == null) {
-      return undefined;
-    }
-    const entry = holder.lock.bundles[bundleId];
-    const files = entry.files.map((file) => ({ path: toSlashes(file.path), checksum: file.checksum }));
-    const keep = new Set(await findModifiedFiles(this.fs, workspaceFolder, files));
-    for (const old of olds) {
-      for (const [id, other] of Object.entries(old.lock?.bundles ?? {})) {
-        if (old !== holder || id !== bundleId) {
-          other.files.forEach((file) => keep.add(toSlashes(file.path)));
-        }
-      }
-    }
-    for (const location of await this.locations(workspaceFolder)) {
-      for (const listed of await this.listedPathsIn(location)) {
-        keep.add(toSlashes(path.relative(workspaceFolder, path.join(location.root, ...listed.split('/')))));
-      }
-    }
-
-    const updated = cleanupOrphanedSource(removeBundleEntry(holder.lock, bundleId), entry.sourceId);
-    await this.saveOldLockfile(holder.path, updated);
-
-    const removal = await this.service.deleteSuperseded({
-      deletedFiles: files.map((file) => file.path).filter((file) => !keep.has(file)),
-      location: { level: 'repository', root: workspaceFolder, path: holder.path, commitMode: holder.commitMode }
-    });
-    return { deleted: removal.deleted, kept: files.map((file) => file.path).filter((file) => keep.has(file)), warnings: removal.warnings };
-  }
-
-  /**
-   * Remap a source id (BR11.9): both record files first, through
-   * `InstallRecordService.remapSource`, then the old `prompt-registry`
-   * lockfiles that use it, through app's `remapSourceId`.
+   * Remap a source id in both record files (BR11.9), through
+   * `InstallRecordService.remapSource`. The caller migrates the old
+   * `prompt-registry` files first (BR18.1), so none is left to change.
    * @param workspaceFolder - Absolute workspace folder path.
    * @param from - Source id being retired.
    * @param to - Replacement source id.
    * @param descriptor - Replacement source as resolved by app's `remapBundleSource`.
-   * @throws {RegistryError} Any `RECORD.*` error from the record remap; nothing is changed in the old files then.
+   * @throws {RegistryError} Any `RECORD.*` error from the record remap.
    */
   public async remapSource(workspaceFolder: string, from: string, to: string, descriptor: LockfileSourceDescriptor): Promise<void> {
     let recordDescriptor: RecordSourceDescriptor = { ...descriptor };
@@ -753,12 +809,93 @@ export class ExtensionRecordAdapter {
     }
     const result = await this.service.remapSource({ root: await this.resolveRoot(workspaceFolder), from, to, descriptor: recordDescriptor });
     result.warnings.forEach((warning) => this.logger.warn(warning));
-    for (const old of await this.readOldLockfiles(workspaceFolder)) {
-      const uses = old.lock !== null && (Object.hasOwn(old.lock.sources, from)
-        || Object.values(old.lock.bundles).some((entry) => entry.sourceId === from));
-      if (uses && old.lock !== null) {
-        await writeLockfile(old.path, remapSourceId(old.lock, from, to, descriptor), this.lockfileFs);
-      }
+  }
+
+  /**
+   * A bundle's `unknown` entry when it is the bundle's only entry at the level
+   * (BR21.4): a migrated bundle no tool has reinstalled yet.
+   * @param bundleId - Bundle id.
+   * @param workspaceFolder - Absolute workspace folder path for the repository level; the user level without it.
+   * @throws {RegistryError} Any `RECORD.*` error from loading.
+   */
+  public async findLoneUnknownEntry(bundleId: string, workspaceFolder?: string): Promise<LocatedToolEntry | undefined> {
+    const entries = workspaceFolder === undefined ? await this.findUserEntries(bundleId) : await this.findEntries(workspaceFolder, bundleId);
+    return entries.length === 1 && entries[0].tool === UNKNOWN_TOOL_NAME ? entries[0] : undefined;
+  }
+
+  /**
+   * Migrate the older records of a level into its 3.0.0 records before an
+   * action's first record change (W24; BR18.1, BR18.2). Called only at the
+   * write entry points, never from a lookup or a listing.
+   *
+   * - repository level: app's `migrateRecords` at the git root of `root`,
+   *   which renames and merges `prompt-registry.lock.json` and
+   *   `prompt-registry.local.lock.json` there;
+   * - user level, outside WSL: the same on the user record, importing the
+   *   CLI's old user lockfile once and this profile's RegistryStorage user
+   *   installs under the host tool (BR20.2); each of those is then removed from
+   *   RegistryStorage without touching its files. A failed removal is logged
+   *   and shown once; the next run removes it. In WSL nothing is migrated.
+   *
+   * The report is logged and shown once (see {@link showMigrationReport}).
+   * Runs in the record file's queue, after any earlier change of it.
+   * @param level - Level the action changes.
+   * @param root - Repository: a workspace folder or its git root. User: ignored (the home folder).
+   * @returns The report, or `undefined` when there was nothing to migrate.
+   * @throws {RegistryError} Any `RECORD.*` error from the migration, after it was shown once; nothing was written then.
+   */
+  public async migrateBeforeWrite(level: RecordLevel, root: string): Promise<MigrationReport | undefined> {
+    if (level === 'user' && !this.usesSharedUserRecord()) {
+      return undefined;
     }
+    const targets = level === 'user' ? [this.userLocation()] : await this.locations(root);
+    return this.serialize(targets[0].path, async () => {
+      const profileEntries = level === 'user' ? await this.buildProfileEntries() : [];
+      let report: MigrationReport | undefined;
+      try {
+        report = await migrateRecords({
+          store: this.store,
+          fs: this.fs,
+          level,
+          root: targets[0].root,
+          targets,
+          ...(level === 'user' ? { oldUserLockfile: resolveUserConfigPaths(this.env).userLockfile, profileEntries } : {}),
+          now: () => new Date()
+        });
+      } catch (error) {
+        this.showRecordError(error, [], targets[0].root);
+        throw error;
+      }
+      if (report !== undefined) {
+        await this.retireProfileInstalls(profileEntries.map((entry) => entry.bundleId));
+        this.showMigrationReport(report, targets[0].path);
+      }
+      return report;
+    });
+  }
+
+  /**
+   * Log a migration report and show it once (BR22.2, NFR5.4): one information
+   * notification per record path and `migratedAt`, remembered in
+   * `globalState`, with "Show details" opening the output channel. A report
+   * that only marks the user record as imported is logged without a notification.
+   * @param report - The report.
+   * @param recordPath - Record file the report belongs to (the committed file at repository level).
+   */
+  public showMigrationReport(report: MigrationReport, recordPath: string): void {
+    this.logger.info(`${MIGRATION_LOG_PREFIX} (${recordPath}): ${JSON.stringify(report)}`);
+    const key = `${MIGRATION_SHOWN_KEY_PREFIX}:${recordPath}:${report.migratedAt}`;
+    if (!hasMigrated(report) || this.shownMigrations.has(key) || this.memento?.get<boolean>(key) === true) {
+      return;
+    }
+    this.shownMigrations.add(key);
+    void Promise.resolve(this.memento?.update(key, true)).catch((error: unknown) => {
+      this.logger.warn(`Could not remember the migration notification ${key}:`, error instanceof Error ? error : undefined);
+    });
+    void Promise.resolve(vscode.window.showInformationMessage(migrationMessage(report), SHOW_DETAILS)).then((choice) => {
+      if (choice === SHOW_DETAILS) {
+        this.logger.show();
+      }
+    });
   }
 }

@@ -75,7 +75,9 @@ import {
   readTargetsSafely,
   recordOutputFields,
   recordRepositoryUninstall,
+  recordUnknownUninstall,
   RegistryError,
+  renderMigration,
   renderRecordLine,
   resolveEffectiveTarget,
   resolveTarget,
@@ -273,7 +275,7 @@ export class UninstallCommand extends BaseUninstallCommand {
         return await performLockfileUninstall(opts, target, ctx, fmt);
       }
 
-      return await performBundleUninstall(opts, target, ctx, fmt);
+      return await performBundleUninstall(opts, target, ctx, fmt, typedTarget);
     } catch (err) {
       if (err instanceof RegistryError) {
         return failWith(ctx, fmt, 'uninstall', err);
@@ -475,28 +477,36 @@ async function findAllBundleEntries(
  * @param target Target configuration.
  * @param ctx CLI context.
  * @param fmt Output format.
+ * @param typedTarget Whether `--target` was typed; only a plain uninstall removes a lone `unknown` entry (BR21.3).
  * @returns Exit code.
  */
 async function performBundleUninstall(
   opts: UninstallOptions,
   target: Target,
   ctx: Context,
-  fmt: OutputFormat
+  fmt: OutputFormat,
+  typedTarget: boolean
 ): Promise<number> {
   const bundleId = opts.bundle as string;
+  let prepared: PreparedRepositoryUninstall | undefined;
   if (target.scope === 'repository' || target.scope === 'user') {
-    // The new record files are loaded first: a RECORD.* error stops here
-    // with nothing removed. A bundle recorded there for this target's type is
-    // uninstalled from the record; any other falls back to the old store.
-    const prepared = target.scope === 'repository'
-      ? await prepareRepositoryUninstall(ctx, target)
-      : await prepareUserUninstall(ctx, target);
+    // The new record files are loaded and the level migrated first: a
+    // RECORD.* error stops here with nothing removed. A bundle recorded there
+    // for this target's type is uninstalled from the record; any other falls
+    // back to the old store.
+    prepared = target.scope === 'repository'
+      ? await prepareRepositoryUninstall(ctx, target, { dryRun: opts.dryRun })
+      : await prepareUserUninstall(ctx, target, { dryRun: opts.dryRun });
     const recordedFiles = prepared.entries.get(bundleId);
     if (recordedFiles !== undefined) {
       return await performRecordBundleUninstall({ opts, target, ctx, fmt }, prepared, bundleId, recordedFiles);
     }
+    if (!typedTarget && prepared.loneUnknown?.has(bundleId) === true) {
+      return await performUnknownBundleUninstall({ opts, target, ctx, fmt }, prepared, bundleId);
+    }
   }
-  const entry = await findBundleEntry(bundleId, target, opts, ctx);
+  // The imported old user lockfile is not read at user level any more (BR20.1).
+  const entry = prepared?.ignoresOldStore === true ? null : await findBundleEntry(bundleId, target, opts, ctx);
 
   if (entry === null) {
     formatOutput({
@@ -507,9 +517,11 @@ async function performBundleUninstall(
       data: {
         target: target.name,
         bundle: bundleId,
-        reason: 'not found in lockfile'
+        reason: 'not found in lockfile',
+        ...(prepared?.migration === undefined ? {} : { migration: prepared.migration })
       },
       textRenderer: (d) => `Bundle "${d.bundle}" is not installed in target "${d.target}". Nothing to uninstall.\n`
+        + renderMigration(d.migration)
     });
     return 0;
   }
@@ -625,12 +637,71 @@ async function performRecordBundleUninstall(
       target: target.name,
       bundle: bundleId,
       removed: recorded.removed,
-      lockfile: recorded.lockfile
+      lockfile: recorded.lockfile,
+      ...(prepared.migration === undefined ? {} : { migration: prepared.migration })
     },
     warnings: recorded.warnings.length > 0 ? recorded.warnings : undefined,
     textRenderer: (d) => `Uninstalled ${d.bundle} from target "${d.target}" `
       + `(${d.removed.length} file${d.removed.length === 1 ? '' : 's'} removed). `
       + `Updated ${d.lockfile}.\n`
+      + renderMigration(d.migration)
+      + renderRecordLine({ level: d.level, records: d.records })
+  });
+  return 0;
+}
+
+/**
+ * Plain `uninstall <bundle>` of a bundle whose only entry at the level is
+ * `unknown` (BR21.3): the entry is removed and every file it listed is kept,
+ * because the tool that wrote them is not known.
+ * @param run Options, target, context and output format.
+ * @param prepared The level's record files, loaded, checked and migrated.
+ * @param bundleId Bundle to uninstall.
+ * @returns Exit code.
+ */
+async function performUnknownBundleUninstall(
+  run: UninstallRun,
+  prepared: PreparedRepositoryUninstall,
+  bundleId: string
+): Promise<number> {
+  const { opts, target, ctx, fmt } = run;
+  const keptNote = (count: number): string =>
+    `${String(count)} file${count === 1 ? '' : 's'} kept because their tool is unknown`;
+  if (opts.dryRun === true) {
+    formatOutput({
+      ctx,
+      command: 'uninstall',
+      output: fmt,
+      status: 'ok',
+      data: { dryRun: true, target: target.name, bundle: bundleId, files: [] as string[] },
+      textRenderer: (d) => `[dry-run] Would remove the record entry of "${d.bundle}" (tool unknown); its files would be kept.\n`
+        + 'Run without --dry-run to apply.\n'
+    });
+    return 0;
+  }
+
+  const recorded = await recordUnknownUninstall(prepared, bundleId);
+  formatOutput({
+    ctx,
+    command: 'uninstall',
+    output: fmt,
+    status: 'ok',
+    data: {
+      level: prepared.location.level,
+      records: [recorded.lockfile],
+      target: target.name,
+      bundle: bundleId,
+      tool: 'unknown',
+      removed: recorded.removed,
+      kept: recorded.kept,
+      lockfile: recorded.lockfile,
+      ...(prepared.migration === undefined ? {} : { migration: prepared.migration })
+    },
+    warnings: recorded.warnings.length > 0 ? recorded.warnings : undefined,
+    textRenderer: (d) => `Removed the record entry of ${d.bundle} (tool unknown); ${keptNote(d.kept.length)}. `
+      + `Updated ${d.lockfile}.\n`
+      + d.kept.map((file) => `  kept ${file}\n`).join('')
+      + renderMigration(d.migration)
       + renderRecordLine({ level: d.level, records: d.records })
   });
   return 0;
@@ -847,17 +918,21 @@ async function performAllUninstall(
   // installed before the record still go.
   let prepared: PreparedRepositoryUninstall | undefined;
   if (target.scope === 'repository') {
-    prepared = await prepareRepositoryUninstall(ctx, target);
+    prepared = await prepareRepositoryUninstall(ctx, target, { dryRun: opts.dryRun });
   } else if (target.scope === 'user') {
-    prepared = await prepareUserUninstall(ctx, target);
+    prepared = await prepareUserUninstall(ctx, target, { dryRun: opts.dryRun });
   }
   const recordedIds = prepared === undefined ? [] : [...prepared.entries.keys()];
   // An id uninstalled from the record is not removed again from the old
-  // store, so each id is handled and reported once.
+  // store, so each id is handled and reported once. The imported old user
+  // lockfile is not read at user level any more (BR20.1).
   const recordedSet = new Set(recordedIds);
-  const entries = Object.fromEntries(
-    Object.entries(await findAllBundleEntries(target, opts, ctx)).filter(([id]) => !recordedSet.has(id))
-  );
+  const ignoresOldStore = prepared?.ignoresOldStore === true;
+  const entries = ignoresOldStore
+    ? {}
+    : Object.fromEntries(
+      Object.entries(await findAllBundleEntries(target, opts, ctx)).filter(([id]) => !recordedSet.has(id))
+    );
   const bundleIds = [...recordedIds, ...Object.keys(entries)];
 
   // Dry-run: show what would be removed without deleting
@@ -901,7 +976,7 @@ async function performAllUninstall(
       writerFactory
     });
     results.push(...await pipeline.runAll({ exclude: recordedSet }));
-  } else {
+  } else if (!ignoresOldStore) {
     // Old user lockfile: bundles not uninstalled from the user record above.
     const lockPath = lockfilePathForTarget(ctx, target);
     results.push(...await runAllUserScopeUninstall(lockPath, target, ctx, writerFactory(target), recordedSet));
@@ -915,9 +990,11 @@ async function performAllUninstall(
       status: 'ok',
       data: {
         target: target.name,
-        uninstalled: 0
+        uninstalled: 0,
+        ...(prepared?.migration === undefined ? {} : { migration: prepared.migration })
       },
       textRenderer: (d) => `No bundles installed in target "${d.target}". Nothing to uninstall.\n`
+        + renderMigration(d.migration)
     });
     return 0;
   }
@@ -941,11 +1018,13 @@ async function performAllUninstall(
     data: {
       target: target.name,
       uninstalled: results.length,
-      bundles: results.map((r) => ({ id: r.bundleId, removed: r.removed.length }))
+      bundles: results.map((r) => ({ id: r.bundleId, removed: r.removed.length })),
+      ...(prepared?.migration === undefined ? {} : { migration: prepared.migration })
     },
     warnings: warnings.length > 0 ? warnings : undefined,
     textRenderer: (d) => `Uninstalled ${d.uninstalled} bundle${d.uninstalled === 1 ? '' : 's'} `
       + `from target "${d.target}".\n`
+      + renderMigration(d.migration)
   });
   return 0;
 }
@@ -1013,7 +1092,7 @@ export const createUninstallCommand = (
           return await performLockfileUninstall(opts, target, ctx, fmt);
         }
 
-        return await performBundleUninstall(opts, target, ctx, fmt);
+        return await performBundleUninstall(opts, target, ctx, fmt, opts.target !== undefined && opts.target.length > 0);
       } catch (err) {
         if (err instanceof RegistryError) {
           return failWith(ctx, fmt, 'uninstall', err);

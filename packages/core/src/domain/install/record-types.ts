@@ -55,6 +55,13 @@ export const RECORD_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
 /** Tool key for entries whose tool could not be identified during migration (written from U5). */
 export const UNKNOWN_TOOL_NAME = 'unknown';
 
+/**
+ * Top-level user-record field set when the CLI's 2.0.0 user lockfile was
+ * imported (BR20.1), holding the import time. While it is present the old
+ * user lockfile is never imported or read at user level again.
+ */
+export const IMPORTED_USER_LOCKFILE_FIELD = 'importedUserLockfileAt';
+
 /** Level a record belongs to. U1 writes the repository level only. */
 export type RecordLevel = 'repository' | 'user';
 

@@ -6,17 +6,20 @@
  * or the resolved target's scope. Only `status` and a bare `install` have no
  * given level: they use the repository level when a new record file is at the
  * git root of the current folder or an old `prompt-registry.*` file is found
- * by today's upward walk, and the user level otherwise. Every repository
+ * there by today's upward walk (a file in a sub-folder or above the git root
+ * is ignored), and the user level otherwise. Every repository
  * record file selected is loaded through the `RecordStore` before this
  * returns, so a hostile or malformed record stops the command with a
  * `RECORD.*` error before anything is written. With the shared user record
  * and home passed in, the user level selects that record (rooted at home)
- * and keeps the old user lockfile as its old store (BR15.1); workspace scope
+ * and keeps the old user lockfile as its old store (BR15.1) until the user
+ * record carries `importedUserLockfileAt` (BR20.1); workspace scope
  * keeps the old user lockfile only (RQ4).
  * @module records/select-record
  */
 import * as path from 'node:path';
 import {
+  IMPORTED_USER_LOCKFILE_FIELD,
   type InstallationScope,
   LOCAL_RECORD_FILE_NAME,
   RECORD_FILE_NAMES,
@@ -24,6 +27,9 @@ import {
   type RecordLevel,
   type RecordLocation,
 } from '@ai-primitives-hub/core';
+import {
+  resolveRepositoryRoot,
+} from './git-root';
 import type {
   RecordStore,
 } from './record-store';
@@ -133,8 +139,9 @@ const sharedUserSelection = async (
     return userSelection(options.userLockfile, reason, inferred);
   }
   const location = options.store.resolveUser({ home: options.home, path: options.userRecord });
-  await options.store.load(location);
-  const oldExists = await options.fs.exists(options.userLockfile);
+  const { record } = await options.store.load(location);
+  // Once the old user lockfile was imported, the user level no longer reads it (BR20.1).
+  const oldExists = record[IMPORTED_USER_LOCKFILE_FIELD] === undefined && await options.fs.exists(options.userLockfile);
   return {
     level: 'user',
     root: location.root,
@@ -146,13 +153,19 @@ const sharedUserSelection = async (
 };
 
 /**
- * The old repository file found from `start`, ignoring the user lockfile the walk may fall back to.
+ * The old repository file found from `start`, accepted only at the git root
+ * of `start` (security-design "Which old files"); the user lockfile the walk
+ * may fall back to, and a file in a sub-folder or above the root, are ignored.
  * @param options - Selection inputs.
  * @param start - Folder the walk starts from.
  */
 const findOldRepositoryFile = async (options: SelectRecordOptions, start: string): Promise<string | undefined> => {
   const found = await options.findOldLockfile(start);
-  return found === null || path.resolve(found) === path.resolve(options.userLockfile) ? undefined : found;
+  if (found === null || path.resolve(found) === path.resolve(options.userLockfile)) {
+    return undefined;
+  }
+  const root = await resolveRepositoryRoot(options.fs, start);
+  return path.dirname(path.resolve(found)) === root ? found : undefined;
 };
 
 /**
