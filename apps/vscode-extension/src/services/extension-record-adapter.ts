@@ -14,12 +14,16 @@
  * - `buildSource`: the configured source an install records (active hub,
  *   then detached `default-local`, then any stored source);
  * - `showRecordError`: one error notification with "Open file";
+ * - the user record (BR16.x): its location under the home folder, the
+ *   pre-write home check of the user target folders, the other-tool refusal
+ *   and the profile-retirement order (unsync, then remove the installation);
  * - the old `prompt-registry.lock.json` files, read and changed through
  *   app's `json-lockfile-store` (listing, retirement, source remap).
  * @module services/extension-record-adapter
  */
 import * as path from 'node:path';
 import {
+  assertUserFolderInsideHome,
   cleanupOrphanedSource,
   createInstallRecordServices,
   deleteLockfile,
@@ -41,6 +45,7 @@ import {
   type RecordStore,
   remapSourceId,
   removeBundleEntry,
+  resolveUserHome,
   toRecordSource,
   upsertBundleEntry,
   upsertSource,
@@ -51,6 +56,7 @@ import {
   describeRecordError,
   isRecordError,
   type LockfileSourceDescriptor,
+  recordError,
   recordErrorDetails,
   type RecordFs,
   type RecordLocation,
@@ -65,6 +71,7 @@ import type {
 import {
   type CliManagedAction,
   cliManagedError,
+  cliManagedMessage,
   markErrorShown,
   wasErrorShown,
 } from '../utils/cli-managed';
@@ -100,6 +107,10 @@ export interface ExtensionRecordAdapterOptions {
   fs?: RecordFs;
   /** Host tool; `detectHostApp()` by default. */
   hostTool?: TargetType;
+  /** Absolute user record path (`AppStoragePaths.userRecord`); the user record is not used without it. */
+  userRecordPath?: string;
+  /** Environment for the home folder (`resolveUserHome`); `process.env` by default. */
+  env?: Record<string, string | undefined>;
 }
 
 /** One old `prompt-registry` lockfile at a workspace root. */
@@ -167,6 +178,10 @@ export class ExtensionRecordAdapter {
   private readonly sources: RecordSourcesPort;
   private readonly lockfileFs: LockfileFs;
   private readonly logger = Logger.getInstance();
+  /** The user level's home folder; the root of every user record path (BR14.3). */
+  public readonly home: string;
+  private readonly userRecordPath: string | undefined;
+  private loggedWslUserRecord = false;
 
   public constructor(options: ExtensionRecordAdapterOptions) {
     const services = createInstallRecordServices({ generatedBy: getExtensionRecordGeneratedBy(), fs: options.fs });
@@ -176,6 +191,8 @@ export class ExtensionRecordAdapter {
     this.hostTool = options.hostTool ?? detectHostApp();
     this.sources = options.sources;
     this.lockfileFs = new RecordLockfileFs(this.fs);
+    this.home = resolveUserHome(options.env ?? process.env);
+    this.userRecordPath = options.userRecordPath;
   }
 
   /**
@@ -302,6 +319,121 @@ export class ExtensionRecordAdapter {
       return;
     }
     throw cliManagedError(bundleId, action, tools.toSorted()[0]);
+  }
+
+  /**
+   * Whether user installs are recorded in the shared user record (BR16.x): a
+   * user record path is configured and the extension does not run in WSL,
+   * where user files go to the Windows home, outside the WSL home the record
+   * is rooted at. The WSL case is logged once.
+   */
+  public usesSharedUserRecord(): boolean {
+    if (vscode.env.remoteName === 'wsl') {
+      if (!this.loggedWslUserRecord) {
+        this.loggedWslUserRecord = true;
+        this.logger.info('The shared user record is not used in WSL; user installs are tracked by the extension only.');
+      }
+      return false;
+    }
+    return this.userRecordPath !== undefined;
+  }
+
+  /**
+   * The user record location, rooted at the home folder (BR14.2, BR14.3).
+   * @throws {Error} When no user record path is configured.
+   */
+  public userLocation(): RecordLocation {
+    if (this.userRecordPath === undefined) {
+      throw new Error('No user record path is configured for the extension record adapter');
+    }
+    return this.store.resolveUser({ home: this.home, path: this.userRecordPath });
+  }
+
+  /**
+   * Load and check the user record, then refuse any user target folder
+   * outside the home folder, before any file is written (NFR5.2, NFR4.16).
+   * @param folders - Absolute folders the user install writes into.
+   * @returns The user location.
+   * @throws {RegistryError} Any `RECORD.*` error from loading; `RECORD.PATH_OUTSIDE_ROOT` for a folder outside home.
+   */
+  public async prepareUserInstall(folders: readonly string[]): Promise<RecordLocation> {
+    const location = this.userLocation();
+    await this.store.load(location);
+    for (const folder of folders) {
+      await assertUserFolderInsideHome(this.fs, this.home, folder);
+    }
+    return location;
+  }
+
+  /**
+   * Every tool entry of a bundle in the user record.
+   * @param bundleId - Bundle id.
+   * @throws {RegistryError} Any `RECORD.*` error from loading.
+   */
+  public async findUserEntries(bundleId: string): Promise<LocatedToolEntry[]> {
+    return this.service.findEntries([this.userLocation()], bundleId);
+  }
+
+  /**
+   * The host tool's entry of a bundle in the user record.
+   * @param bundleId - Bundle id.
+   * @throws {RegistryError} Any `RECORD.*` error from loading.
+   */
+  public async findUserHostEntry(bundleId: string): Promise<LocatedToolEntry | undefined> {
+    return (await this.service.findEntries([this.userLocation()], bundleId, this.hostTool))[0];
+  }
+
+  /**
+   * Every tool entry of every bundle in the user record.
+   * @throws {RegistryError} Any `RECORD.*` error from loading.
+   */
+  public async listUserEntries(): Promise<LocatedToolEntry[]> {
+    return this.service.listToolEntries([this.userLocation()]);
+  }
+
+  /**
+   * Refuse an action on a user-level bundle whose user record entries all
+   * belong to another tool (BR11.2, NFR4.12 at user level). A bundle with a
+   * host-tool entry, or with no user record entry, is allowed.
+   * @param bundleId - Bundle the action targets.
+   * @param action - The action, for the message.
+   * @throws {RegistryError} `RECORD.CLI_MANAGED` naming the tool and "a <tool> user target"; any `RECORD.*` error from loading.
+   */
+  public async assertUserHostTool(bundleId: string, action: CliManagedAction): Promise<void> {
+    const tools = (await this.findUserEntries(bundleId)).map((located) => located.tool);
+    if (tools.length === 0 || tools.includes(this.hostTool)) {
+      return;
+    }
+    const tool = tools.toSorted()[0];
+    throw recordError('RECORD.CLI_MANAGED', {
+      message: cliManagedMessage(bundleId, action, tool).replace(`<a ${tool} target>`, `<a ${tool} user target>`),
+      hint: '',
+      context: { bundleId, action, tool, level: 'user' }
+    });
+  }
+
+  /**
+   * Retire a bundle's profile-level (user) installation (BR16.x): unsync its
+   * user files except those any user record entry still lists, then remove
+   * the installation. Errors propagate; nothing is swallowed.
+   * @param bundleId - Bundle being retired, for the log.
+   * @param unsync - Removes the bundle's user files, leaving every path in `keep`.
+   * @param removeInstallation - Removes the extension's installation of the bundle.
+   * @throws {RegistryError} Any `RECORD.*` error from loading the user record; nothing is removed then.
+   */
+  public async retireProfileEntry(
+    bundleId: string,
+    unsync: (keep: Set<string>) => Promise<void>,
+    removeInstallation: () => Promise<void>
+  ): Promise<void> {
+    const location = this.userLocation();
+    const keep = new Set<string>();
+    for (const listed of await this.listedPathsIn(location)) {
+      keep.add(path.join(location.root, ...listed.split('/')));
+    }
+    this.logger.debug(`Retiring the profile installation of ${bundleId}; ${keep.size} user record path(s) kept`);
+    await unsync(keep);
+    await removeInstallation();
   }
 
   /**
