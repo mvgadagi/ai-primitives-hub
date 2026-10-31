@@ -575,9 +575,10 @@ async function autoDetectHubSource(opts: InstallOptions, ctx: Context, userPaths
  * Detect install context from the project environment.
  * Fills in `opts.lockfile`, `opts.source`, `opts.interactive`, and `opts.target`
  * when they can be inferred without user input. `--lockfile` on a new record
- * file, or a bare `install` that finds a 3.0.0 record with entries, selects
- * that record for replay (W6 step 1; BR6.2): every selected file is loaded
- * and checked here, before anything is written (NFR4.8).
+ * file, or a bare `install` that finds a 3.0.0 record with entries or an old
+ * `prompt-registry` file at the git root, selects that record for replay
+ * (W6 step 1; BR6.2, BR18.1; the old file is migrated first): every selected
+ * file is loaded and checked here, before anything is written (NFR4.8).
  * @param opts Install options (mutated in-place).
  * @param ctx CLI context.
  * @returns The selected 3.0.0 record to replay, or `undefined` for today's modes.
@@ -600,7 +601,10 @@ async function detectInstallContext(opts: InstallOptions, ctx: Context): Promise
 
   if (noMode && !opts.interactive) {
     const prepared = await prepareRecordSelection(ctx, { command: 'install', scope: opts.scope });
-    if ((await prepared.service.listEntries(prepared.selection.locations)).length > 0) {
+    const { selection } = prepared;
+    // An old file at the git root is migrated first, then the record is replayed (BR18.1).
+    const migratesOldFile = selection.level === 'repository' && selection.oldLockfile !== undefined;
+    if (migratesOldFile || (await prepared.service.listEntries(selection.locations)).length > 0) {
       return prepareRecordSelection(ctx, { command: 'install', scope: opts.scope, write: true });
     }
     const found = await findProjectLockfile(ctx);
