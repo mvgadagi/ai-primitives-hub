@@ -111,6 +111,7 @@ const sha256 = (text: string): string => `sha256:${createHash('sha256').update(t
 /**
  * Deployment manifest of a bundle version.
  * @param bundle - Bundle version.
+ * @param bundleId - Bundle id the manifest declares.
  */
 const manifestOf = (bundle: BundleVersion, bundleId = BUNDLE_ID): string => {
   const prompts = bundle.items.map((item) => `  - id: ${item.id}\n    file: ${item.file}\n    type: ${item.type}\n`).join('');
@@ -557,6 +558,27 @@ suite('user record (U4)', function () {
     await manager.uninstallBundle(BUNDLE_ID, 'user');
 
     assert.strictEqual(await listedUser(), undefined);
+  });
+
+  test('concurrent user-scope installs of different bundles all end up in the user record under vscode', async () => {
+    const ids = ['concurrent-a', 'concurrent-b', 'concurrent-c'];
+    const installer = manager.getBundleInstaller();
+
+    await Promise.all(ids.map((id) => {
+      const version: BundleVersion = {
+        version: '1.0.0',
+        files: { [`prompts/${id}.prompt.md`]: `# ${id}\n` },
+        items: [{ id, file: `prompts/${id}.prompt.md`, type: 'prompt' }]
+      };
+      return installer.installFromBuffer({ ...v1Bundle(), id }, zipOf(version, id), { scope: 'user' }, 'local');
+    }));
+
+    const record = readUserRecord();
+    assert.deepStrictEqual(Object.keys(record.bundles).toSorted(), ids);
+    for (const id of ids) {
+      assert.deepStrictEqual(Object.keys(record.bundles[id].tools), ['vscode'], id);
+      assert.deepStrictEqual(record.bundles[id].tools.vscode.files.map((file: { path: string }) => file.path), [`.copilot/prompts/${id}.prompt.md`], id);
+    }
   });
 
   test('a user-scope install with a malformed user record shows one error naming the file and writes nothing to the user folders', async () => {
