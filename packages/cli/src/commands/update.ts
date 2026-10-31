@@ -262,7 +262,7 @@ export class UpdateCommand extends BaseUpdateCommand {
       // Select the record first: every selected file is loaded and checked
       // before anything is fetched or written (W5 step 1, NFR4.8).
       const prepared = await prepareRecordSelection(ctx, { command: 'update', lockfile: this.lockfile, scope: opts.scope }, target);
-      if (prepared.selection.level === 'repository' && prepared.selection.locations.length > 0) {
+      if (prepared.selection.locations.length > 0) {
         const rows = await prepared.service.listEntries(prepared.selection.locations);
         if (rows.length > 0) {
           if (!this.noHubSync) {
