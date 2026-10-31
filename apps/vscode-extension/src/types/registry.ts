@@ -118,8 +118,9 @@ export interface InstalledBundle {
   filesMissing?: boolean; // Set when lockfile entry exists but files are missing (repository scope only)
   /**
    * `'install-record'` when the item comes from a 3.0.0 install record
-   * (`ai-primitives-hub.lock.json` / `.local.lock.json`); absent for items from
-   * the prompt-registry lockfiles or RegistryStorage (BR5.2).
+   * (`ai-primitives-hub.lock.json` / `.local.lock.json`, or the shared user
+   * record at user scope); absent for items from the prompt-registry
+   * lockfiles or RegistryStorage (BR5.2, BR16.x).
    */
   recordOrigin?: 'install-record';
 }

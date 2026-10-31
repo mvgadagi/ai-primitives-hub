@@ -1,6 +1,7 @@
 /**
  * Install record listing for the extension's repository view (workflow W2;
- * BR5.1, BR5.2, BR5.4, BR5.5, BR5.7).
+ * BR5.1, BR5.2, BR5.4, BR5.5, BR5.7), and the user-scope items of the
+ * shared user record (BR16.x).
  *
  * Reads the 3.0.0 repository records (`ai-primitives-hub.lock.json` and
  * `ai-primitives-hub.local.lock.json`, at the git root) through the shared
@@ -293,7 +294,56 @@ export class InstallRecordListing {
     }
     return [...fromRecords.values(), ...old.filter((bundle) => !fromRecords.has(bundle.bundleId))];
   }
+
+  /**
+   * List the bundles of the shared user record as user-scope items (BR16.x):
+   * one item per bundle, from the host tool's entry when it has one (the
+   * entry the extension acts on; another tool's entry is refused at action
+   * time), else from its latest entry. A `RECORD.*` error is reported once
+   * and gives no item.
+   * @param location - The user record location.
+   * @param hostTool - The tool the extension records under.
+   * @param installPathFor - The extension's bundle cache folder of a bundle id.
+   * @returns The items, and the ids the user record holds for the host tool.
+   */
+  public async listUserBundles(
+    location: RecordLocation,
+    hostTool: string,
+    installPathFor: (bundleId: string) => string
+  ): Promise<{ items: InstalledBundle[]; hostBundleIds: Set<string> }> {
+    const items: InstalledBundle[] = [];
+    const hostBundleIds = new Set<string>();
+    for (const [bundleId, bundle] of await this.loadBundles(location)) {
+      const host = Object.hasOwn(bundle.tools, hostTool) ? bundle.tools[hostTool] : undefined;
+      if (host !== undefined) {
+        hostBundleIds.add(bundleId);
+      }
+      const entry = host ?? latestEntry(Object.values(bundle.tools).map((candidate) => ({ entry: candidate, location })))?.entry;
+      if (entry === undefined) {
+        continue;
+      }
+      const item = createInstalledBundleFromLockfile(bundleId, {
+        version: entry.version,
+        sourceId: entry.sourceId,
+        sourceType: entry.sourceType,
+        installedAt: entry.installedAt,
+        files: entry.files.map((file) => ({ path: file.path, checksum: file.checksum }))
+      }, { installPath: installPathFor(bundleId), filesMissing: await this.filesMissing(location.root, entry) });
+      items.push({ ...item, scope: 'user', commitMode: undefined, recordOrigin: 'install-record' });
+    }
+    return { items, hostBundleIds };
+  }
 }
+
+/**
+ * Watch the shared user record file and call `onChange` on create, change or
+ * delete (BR16.x).
+ * @param recordPath - Absolute user record path.
+ * @param onChange - Refreshes the listing.
+ * @returns The watcher's disposable.
+ */
+export const watchUserRecord = (recordPath: string, onChange: () => void): vscode.Disposable =>
+  watchFiles(path.dirname(recordPath), path.basename(recordPath), onChange);
 
 /**
  * Watch both install record files at a root and call `onChange` on create,
