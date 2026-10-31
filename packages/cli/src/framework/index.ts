@@ -115,6 +115,7 @@ export {
   toInstallRecordError,
   toLockfileBundleEntry,
   toLockfileSourceEntry,
+  writerEnv,
 } from './install-record';
 export type {
   CreateHubManagerOptions,

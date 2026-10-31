@@ -98,6 +98,7 @@ import {
   resolveTargetName,
   toLockfileBundleEntry,
   toLockfileSourceEntry,
+  writerEnv,
 } from '../framework';
 
 /**
@@ -595,7 +596,7 @@ function writerFor(ctx: Context, target: Target, scope: string, commitMode: Repo
     fs: ctx.fs,
     userConfigDir: resolveUserConfigDir(ctx.env)
   });
-  return new FileTreeTargetWriter({ fs: ctx.fs, env: ctx.env, transformer, layoutLoader });
+  return new FileTreeTargetWriter({ fs: ctx.fs, env: writerEnv(ctx.env, effectiveScope), transformer, layoutLoader });
 }
 
 async function applyUpdates(

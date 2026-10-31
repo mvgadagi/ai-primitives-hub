@@ -81,6 +81,7 @@ import {
   resolveTarget,
   resolveTargetName,
   validateInputs,
+  writerEnv,
 } from '../framework';
 
 /**
@@ -324,7 +325,7 @@ export const createWriterFactory = (
     const transformer = transformerRegistry.getTransformer(effectiveTarget.type);
     return new FileTreeTargetWriter({
       fs: ctx.fs,
-      env: ctx.env,
+      env: writerEnv(ctx.env, scope),
       transformer,
       layoutLoader
     });
