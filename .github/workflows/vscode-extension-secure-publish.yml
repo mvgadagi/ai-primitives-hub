@@ -1,14 +1,19 @@
 name: Publishing
 
+# The extension shares its version with the npm packages (ADR-0011).
+# packages-release.yml calls this workflow after it tags and publishes a
+# release. Run it manually only to retry a failed publication: select the
+# release tag as the ref. The version always comes from
+# apps/vscode-extension/package.json at that ref.
 on:
-  release:
-    types: [created]
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      version:
-        description: "Version to publish (e.g., 1.0.0)"
+      tag:
+        description: "Release tag to publish, e.g. v0.3.0; must match apps/vscode-extension/package.json"
         required: true
         type: string
+  workflow_dispatch:
+    inputs:
       prerelease:
         description: "Publish as prerelease"
         required: false
@@ -62,31 +67,37 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
           fetch-depth: 0
 
       - name: Determine version and prerelease status
         id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            VERSION="${{ github.event.release.tag_name }}"
-            IS_PRERELEASE="${{ github.event.release.prerelease }}"
-          else
-            VERSION="${{ github.event.inputs.version }}"
-            IS_PRERELEASE="${{ github.event.inputs.prerelease }}"
-          fi
+          set -euo pipefail
+          VERSION="$(jq -r .version "$EXTENSION_DIR/package.json")"
 
-          # Validate version format
-          if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
-            echo "Invalid version format: $VERSION"
+          # The Marketplace accepts only major.minor.patch.
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid extension version: $VERSION"
+            exit 1
+          fi
+          if [[ -n "$RELEASE_TAG" && "$RELEASE_TAG" != "v$VERSION" ]]; then
+            echo "::error::Release tag $RELEASE_TAG does not match the extension version $VERSION."
             exit 1
           fi
 
-          # Remove 'v' prefix if present
-          VERSION=${VERSION#v}
+          # Unified releases are stable; only a manual run can mark a pre-release.
+          IS_PRERELEASE=false
+          if [[ -z "$RELEASE_TAG" && "$PRERELEASE" == "true" ]]; then
+            IS_PRERELEASE=true
+          fi
 
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
@@ -117,11 +128,6 @@ jobs:
             audit_args+=(--ignore "$ghsa")
           done
           pnpm audit --prod --audit-level=moderate "${audit_args[@]}"
-
-      - name: Update version in package.json
-        working-directory: ${{ env.EXTENSION_DIR }}
-        run: |
-          npm version ${{ steps.version.outputs.version }} --no-git-tag-version
 
       - name: Run final security scan
         uses: aquasecurity/trivy-action@master
@@ -188,13 +194,15 @@ jobs:
     with:
       base64-subjects: "${{ needs.pre-publish-security.outputs.subjects }}"
       upload-assets: true
+      # A called run is triggered by the merged release PR, not by a tag.
+      upload-tag-name: ${{ inputs.tag }}
 
   # Publish to VS Code Marketplace
   publish-marketplace:
     name: Publish to VS Code Marketplace
     runs-on: ubuntu-latest
     needs: [pre-publish-security] # provenance]
-    if: github.event_name == 'release' || contains(github.event.inputs.target_registries, 'vscode-marketplace')
+    if: inputs.tag || contains(inputs.target_registries, 'vscode-marketplace')
 
     environment:
       name: vscode-marketplace
@@ -256,7 +264,7 @@ jobs:
     name: Publish to Open VSX Registry
     runs-on: ubuntu-latest
     needs: [pre-publish-security] # provenance]
-    if: github.event_name == 'release' || contains(github.event.inputs.target_registries, 'open-vsx')
+    if: inputs.tag || contains(inputs.target_registries, 'open-vsx')
 
     environment:
       name: open-vsx
@@ -329,6 +337,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
       - name: Download package artifact
@@ -450,12 +459,12 @@ jobs:
           zip -r ${{env.EXTENSION_NAME}}-vscode-extension-${{ needs.pre-publish-security.outputs.version }}-bundle.zip installation-bundle/
 
       - name: Upload bundle to release
-        if: github.event_name == 'release'
+        if: inputs.tag
         uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{env.EXTENSION_NAME}}-vscode-extension-${{ needs.pre-publish-security.outputs.version }}-bundle.zip
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ inputs.tag }}
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
