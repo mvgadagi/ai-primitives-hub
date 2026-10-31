@@ -260,6 +260,8 @@ export class RecordStore {
       const target = (await this.fs.lstat(location.path))?.kind === 'symlink'
         ? await this.resolveAllowedLink(location, file)
         : location.path;
+      // The user record's folder may not exist yet on a new machine (NFR7.4).
+      await this.fs.mkdir(path.dirname(target), { recursive: true });
       await writeFileAtomically(this.fs, target, text);
     } catch (error) {
       if (isRecordError(error)) {
@@ -299,6 +301,18 @@ export class RecordStore {
       await this.load(location);
     }
     return { locations, location: input.commitMode === 'local-only' ? locations[1] : locations[0] };
+  }
+
+  /**
+   * The user-level record location (BR14.2): one file per machine, rooted at
+   * the home folder, with no commit mode and no git exclude.
+   * @param input - Home folder and record file.
+   * @param input.home - Absolute home folder; the root every user-level path is relative to (BR14.3).
+   * @param input.path - Absolute path of the user record (`AppStoragePaths.userRecord`).
+   * @returns The user location.
+   */
+  public resolveUser(input: { home: string; path: string }): RecordLocation {
+    return { level: 'user', root: input.home, path: input.path };
   }
 
   /**
