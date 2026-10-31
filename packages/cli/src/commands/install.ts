@@ -110,6 +110,7 @@ import {
   prepareOldFileOnly,
   prepareRecordSelection,
   prepareRepositoryRecord,
+  prepareUserRecord,
   readTargetsSafely,
   recordOutputFields,
   recordPlannedInstall,
@@ -1090,9 +1091,11 @@ async function performLocalInstall(
     }
     // Repository scope: both record files are loaded and checked before the
     // writer runs, so a RECORD.* error stops here with nothing written (BR3.5).
+    // User scope: the shared user record is checked the same way, and a
+    // target folder outside home is refused (BR14.3).
     const prepared = effectiveTarget.scope === 'repository'
       ? await prepareRepositoryRecord(ctx, effectiveTarget)
-      : undefined;
+      : (effectiveTarget.scope === 'user' ? await prepareUserRecord(ctx, effectiveTarget) : undefined);
     const writerFactory = createWriterFactory(ctx, opts, prepared?.exclusion);
     const writer = writerFactory(effectiveTarget);
     const { installableFiles: targetFiles, result, skipped } = await writeBundleForInstall(
@@ -1592,9 +1595,10 @@ async function performRemoteInstall(
       return 0;
     }
     // Repository scope: check both record files before anything is written (BR3.5).
+    // User scope: check the shared user record and the target folder (BR14.3).
     const prepared = effectiveTarget.scope === 'repository'
       ? await prepareRepositoryRecord(ctx, effectiveTarget)
-      : undefined;
+      : (effectiveTarget.scope === 'user' ? await prepareUserRecord(ctx, effectiveTarget) : undefined);
     const writerFactory = createWriterFactory(ctx, opts, prepared?.exclusion);
     const writer = writerFactory(effectiveTarget);
     const { installableFiles: targetFiles, result, skipped } = await writeBundleForInstall(
