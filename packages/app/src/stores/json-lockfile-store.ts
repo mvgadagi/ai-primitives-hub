@@ -1,45 +1,27 @@
 /**
- * Install lockfile (repository scope only).
+ * Older 2.0.0 lockfile store, kept only to read and update older files.
  *
- * Adapted to interoperate byte-for-byte with the VS Code extension's
- * `LockfileManager` (`src/services/lockfile-manager.ts`) schema, NOT
- * the reference branch's schema this module was ported from
- * (schemaVersion `1`, single `entries: LockfileEntry[]` array,
- * `target`-keyed). The two are structurally incompatible:
+ * The current record is the 3.0.0 install record
+ * (`ai-primitives-hub.lock.json` / `ai-primitives-hub.local.lock.json` at the
+ * git root, and the shared user record `ai-primitives-hub.user.lock.json`),
+ * keyed by bundle and tool and handled by `records/RecordStore` and
+ * `records/InstallRecordService`. This module reads and writes the older
+ * 2.0.0 shape those records replace:
  *
- *   - Extension (this module): `version: '2.0.0'` (string), `bundles:
- *     Record<bundleId, LockfileBundleEntry>` (object), `files:
- *     LockfileFileEntry[]` (`{path, checksum}`), TWO separate physical
- *     files (`prompt-registry.lock.json` for `commit` mode,
- *     `prompt-registry.local.lock.json` for `local-only` mode —
- *     commitMode is implicit by which file an entry lives in).
- *   - Reference branch's original: `schemaVersion: 1` (number),
- *     `entries: LockfileEntry[]` (array keyed by target+sourceId+
- *     bundleId, to support multi-target lockfiles), `files: string[]`
- *     + parallel `fileChecksums`, ONE file with an explicit per-entry
- *     `commitMode` field.
+ *   - `version: '2.0.0'` (string), `bundles: Record<bundleId,
+ *     LockfileBundleEntry>` (object), `files: LockfileFileEntry[]`
+ *     (`{path, checksum}`), two physical repository files
+ *     (`prompt-registry.lock.json` for `commit` mode,
+ *     `prompt-registry.local.lock.json` for `local-only` mode — commitMode
+ *     is implicit by which file an entry lives in), and the CLI's old
+ *     single-file user lockfile.
+ *   - No `target` or tool field: an entry does not say which tool wrote it,
+ *     which is why migration records such entries under the `unknown` tool.
  *
- * This module mirrors the extension's actual on-disk shape so a CLI
- * install and an extension install of the same bundle produce
- * byte-compatible lockfile entries. Scope: repository only — the
- * lockfile has never tracked user/workspace-scope installs (no
- * reproducibility/team-sharing use case there), so this store — and
- * the uninstall pipeline that uses it — only applies to
- * `target.scope === 'repository'`. No `target` field exists on
- * `LockfileBundleEntry` for the same reason the extension has none:
- * repository scope always writes to `.github/`, invariant of which
- * IDE type nominally triggered the install (see
- * `writers/repo-scope-writer.ts`'s `RepositoryScopeWriterAdapter`,
- * which ignores its `Target` parameter entirely).
- *
- * Install record migration (in progress): repository-scope CLI
- * `install` and `uninstall` now write and read the install record
- * (`ai-primitives-hub.lock.json` / `ai-primitives-hub.local.lock.json`,
- * format 3.0.0) through `records/RecordStore` and
- * `records/InstallRecordService`, and no longer write this store.
- * Uninstall falls back to this store for bundles installed before
- * the change. `update`, `status` and replay still read and write
- * this store until they move to the install record.
+ * It is still used for: migration of the older files into the install
+ * record (`records/record-migration`), the CLI's workspace scope and
+ * `profile activate`, an old-format `--lockfile`, and bundles only an older
+ * file lists (read, updated or uninstalled with today's code, BR10.1).
  * @module stores/json-lockfile-store
  */
 import {
