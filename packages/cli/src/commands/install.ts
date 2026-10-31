@@ -569,6 +569,22 @@ async function autoDetectHubSource(opts: InstallOptions, ctx: Context, userPaths
 }
 
 /**
+ * Refuse `--dry-run` for a record replay: the replay migrates older files and
+ * writes the recorded bundles, and a dry run must write nothing.
+ * @param opts Install options.
+ * @throws {RegistryError} `USAGE.INVALID_FLAG` when `--dry-run` is set; nothing was written.
+ */
+function refuseDryRunReplay(opts: InstallOptions): void {
+  if (opts.dryRun === true) {
+    throw new RegistryError({
+      code: 'USAGE.INVALID_FLAG',
+      message: 'install: --dry-run cannot be used to replay an install record; a replay migrates older records and writes every recorded bundle',
+      hint: 'Run `status` to see what is recorded, or install one bundle with install <bundle-id> --dry-run.'
+    });
+  }
+}
+
+/**
  * Detect install context from the project environment.
  * Fills in `opts.lockfile`, `opts.source`, `opts.interactive`, and `opts.target`
  * when they can be inferred without user input. A bare `install` that finds a
@@ -589,6 +605,7 @@ async function detectInstallContext(opts: InstallOptions, ctx: Context): Promise
     const prepared = await prepareRecordSelection(ctx, { command: 'install', lockfile: opts.lockfile });
     if (prepared.selection.locations.length > 0) {
       // The replay changes the record: migrate its level first (BR18.1).
+      refuseDryRunReplay(opts);
       return prepareRecordSelection(ctx, { command: 'install', lockfile: opts.lockfile, write: true });
     }
   }
@@ -599,6 +616,7 @@ async function detectInstallContext(opts: InstallOptions, ctx: Context): Promise
     // An old file at the git root is migrated first, then the record is replayed (BR18.1).
     const migratesOldFile = selection.level === 'repository' && selection.oldLockfile !== undefined;
     if (migratesOldFile || (await prepared.service.listEntries(selection.locations)).length > 0) {
+      refuseDryRunReplay(opts);
       return prepareRecordSelection(ctx, { command: 'install', scope: opts.scope, write: true });
     }
     const found = await findProjectLockfile(ctx);
