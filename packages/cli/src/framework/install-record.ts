@@ -39,6 +39,7 @@ import {
   resolveUserConfigPaths,
   resolveUserHome,
   selectRecord,
+  type StatusRow,
   type TargetLayout,
 } from '@ai-primitives-hub/app';
 import {
@@ -56,6 +57,7 @@ import {
   type RepositoryExclusion,
   type Target,
   type TokenProvider,
+  UNKNOWN_TOOL_NAME,
 } from '@ai-primitives-hub/core';
 import {
   FileSystemLayoutConfigLoader,
@@ -797,6 +799,107 @@ export const prepareRecordSelection = async (
 };
 
 /**
+ * A read-only record selection with its entries, used by `update` and
+ * `uninstall <bundle-id>` run with no inferred target (BR23.3): the record
+ * decides which tools act, and nothing has been migrated or written yet.
+ */
+export interface RecordDecision {
+  /** What the person typed that fixes the level (`--lockfile`, `--scope`); never a target. */
+  input: Omit<RecordSelectionInput, 'write'>;
+  /** The selection, made with no target: the level from `--lockfile`, then `--scope`, then the default rule (BR6.2). */
+  prepared: PreparedRecordSelection;
+  /** Every (bundle, tool) entry of the selected 3.0.0 record files; bundles only an older store lists are not here. */
+  rows: StatusRow[];
+}
+
+/**
+ * Select the record with no target and list its entries (BR23.3). With
+ * `options.write`, the level is migrated first (BR18.1); without it nothing is
+ * migrated or written, so a command the record does not decide can still fail
+ * with nothing changed (NFR4.27).
+ * @param ctx - CLI context.
+ * @param input - Command name and the `--lockfile` / `--scope` values typed.
+ * @param options - `write`: migrate the level first (a real run, never `--dry-run`).
+ * @param options.write - `true` to migrate before selecting.
+ * @returns The selection and its entries.
+ * @throws {RegistryError} A `RECORD.*` error naming the command and the file.
+ */
+export const prepareRecordDecision = async (
+  ctx: Context,
+  input: Omit<RecordSelectionInput, 'write'>,
+  options: { write?: boolean } = {}
+): Promise<RecordDecision> => {
+  const prepared = await prepareRecordSelection(ctx, { ...input, write: options.write === true });
+  const { selection, service } = prepared;
+  try {
+    const rows = selection.locations.length === 0 ? [] : await service.listEntries(selection.locations);
+    return { input, prepared, rows };
+  } catch (error) {
+    throw isRecordError(error) ? toCommandRecordError(input.command, error) : error;
+  }
+};
+
+/**
+ * The tools a bundle has entries for in a decision's rows, in row order.
+ * @param rows - Rows of a {@link RecordDecision}.
+ * @param bundleId - Bundle id.
+ * @returns Its distinct tool keys.
+ */
+export const recordedTools = (rows: readonly StatusRow[], bundleId: string): string[] =>
+  [...new Set(rows.filter((row) => row.bundleId === bundleId).map((row) => row.tool))];
+
+/** Outcome of {@link prepareUnknownUninstall}. */
+export type PreparedUnknownUninstall =
+  /** The bundle is still a lone `unknown` entry: remove it with {@link recordUnknownUninstall}. */
+  | { uninstall: PreparedRepositoryUninstall }
+  /** The migration changed the bundle's entries: decide again on this post-migration selection. */
+  | { changed: RecordDecision };
+
+/**
+ * Target-free prepare for `uninstall <bundle-id>` of a lone `unknown` entry
+ * with no inferred target (BR23.3, BR21.3). The read-only decision only chose
+ * the path: this selects the record again with `write` so the level is
+ * migrated first (never under `--dry-run`, BR18.1), then reads the entry from
+ * the post-migration records. No keep-path set is needed, because
+ * {@link recordUnknownUninstall} keeps every file.
+ * @param ctx - CLI context.
+ * @param decision - The read-only decision that found the lone `unknown` entry.
+ * @param bundleId - Bundle to uninstall.
+ * @param options - `dryRun`: a preview, which never migrates.
+ * @param options.dryRun - `true` for `--dry-run`.
+ * @returns The prepared uninstall, or the post-migration decision when the entry is no longer a lone `unknown` one.
+ * @throws {RegistryError} A `RECORD.*` error naming the file; nothing was removed.
+ */
+export const prepareUnknownUninstall = async (
+  ctx: Context,
+  decision: RecordDecision,
+  bundleId: string,
+  options: { dryRun?: boolean } = {}
+): Promise<PreparedUnknownUninstall> => {
+  const migrated = options.dryRun === true ? decision : await prepareRecordDecision(ctx, decision.input, { write: true });
+  const tools = recordedTools(migrated.rows, bundleId);
+  if (tools.length !== 1 || tools[0] !== UNKNOWN_TOOL_NAME) {
+    return { changed: migrated };
+  }
+  const { selection, service, migration } = migrated.prepared;
+  try {
+    const location = await service.holdingLocation(selection.locations, bundleId, UNKNOWN_TOOL_NAME);
+    return {
+      uninstall: {
+        location: location ?? selection.locations[0],
+        service,
+        tool: UNKNOWN_TOOL_NAME,
+        entries: new Map(),
+        loneUnknown: new Set((await service.findLoneUnknown(selection.locations)).keys()),
+        ...(migration === undefined ? {} : { migration })
+      }
+    };
+  } catch (error) {
+    throw isRecordError(error) ? toCommandRecordError('uninstall', error) : error;
+  }
+};
+
+/**
  * Configured sources by id for the source trust gate (NFR4.11), in app's
  * `orderConfiguredSources` order: the active hub's sources first, then
  * detached (`default-local`) sources whose id the active hub does not use. A
@@ -928,9 +1031,10 @@ export interface OldFileTargetInput {
 export type OldFileOnlyPlan = OldFileOnlyBundles & ({ target: Target } | { reason: string });
 
 /**
- * The old-file-only bundles and the target that writes them, as today: the
- * given target, else the only configured target, else the last used one,
- * made effective with the overrides (BR10.1).
+ * The old-file-only bundles and the target that writes them: the given
+ * target, else the only configured target (BR23.2), made effective with the
+ * overrides (BR10.1). With none or several configured, the reason is the
+ * missing-target message.
  * @param ctx - CLI context.
  * @param prepared - The command's record selection.
  * @param resolve - Command name, the given target and the overrides.
