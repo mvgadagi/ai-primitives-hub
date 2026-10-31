@@ -592,8 +592,7 @@ async function detectInstallContext(opts: InstallOptions, ctx: Context): Promise
 
   if (noMode && !opts.interactive) {
     const prepared = await prepareRecordSelection(ctx, { command: 'install', scope: opts.scope });
-    if (prepared.selection.level === 'repository'
-      && (await prepared.service.listEntries(prepared.selection.locations)).length > 0) {
+    if ((await prepared.service.listEntries(prepared.selection.locations)).length > 0) {
       return prepared;
     }
     const found = await findProjectLockfile(ctx);
@@ -1407,7 +1406,8 @@ async function performRecordReplay(run: RecordReplayRun): Promise<number> {
         source: { sourceId: entry.sourceId, ...source },
         sourceType: entry.sourceType,
         writtenPaths: written,
-        workspaceRoot: target.rootPath ?? ctx.cwd(),
+        // User level: home is the workspace root, as the user-scope install records it.
+        workspaceRoot: selection.level === 'user' ? selection.root : (target.rootPath ?? ctx.cwd()),
         syncSiblings: false
       }));
       await updateTargetState(ctx, target.name, bundleId, manifest.version);
