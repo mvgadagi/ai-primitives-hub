@@ -7,6 +7,23 @@
 - **MINOR** — New features (backward compatible)
 - **PATCH** — Bug fixes (backward compatible)
 
+`@ai-primitives-hub/core`, `infra`, `app`, `cli` and the VS Code extension
+share one version and are released together
+([ADR-0011](./architecture/adr/0011-one-shared-version-for-packages-and-extension.md)).
+`@prompt-registry/collection-scripts` in `lib/` keeps its own version.
+
+- The version on `main` is always `major.minor.patch`. The VS Code
+  Marketplace rejects prerelease suffixes, so prereleases are npm-only.
+- `apps/vscode-extension/templates/scaffolds/github/package.template.json`
+  depends on `@ai-primitives-hub/cli` `^<shared version>`.
+
+CI enforces both rules. Run the same check locally:
+
+```bash
+pnpm run version:check   # check the five package.json files and the scaffold range
+pnpm run test:scripts    # test the check itself
+```
+
 ## Version Update
 
 Use the automated version scripts:

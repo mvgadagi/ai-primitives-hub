@@ -14,6 +14,7 @@ on:
       - ".github/workflows/vscode-extension-secure-ci.yml"
       - ".github/workflows/scripts/**"
       - ".github/actions/npm-audit-pr-comment/**"
+      - "scripts/**"
   pull_request:
     branches: [main, develop]
     paths:
@@ -27,6 +28,7 @@ on:
       - ".github/workflows/vscode-extension-secure-ci.yml"
       - ".github/workflows/scripts/**"
       - ".github/actions/npm-audit-pr-comment/**"
+      - "scripts/**"
   workflow_dispatch:
 
 # Security: Restrict permissions to minimum necessary (SLSA Level 2)
@@ -44,6 +46,26 @@ env:
   EXTENSION_NAME: "prompt-registry"
 
 jobs:
+  # core, infra, app, cli and the extension share one version (ADR-0011).
+  version-check:
+    name: Shared Version Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Test the version check
+        run: node --test "scripts/*.test.mjs"
+      - name: Check the shared version
+        run: node scripts/check-versions.mjs
+
   # Security Analysis Job - SLSA Level 3 requirement
   security-scan:
     name: Security Analysis & Vulnerability Scanning
