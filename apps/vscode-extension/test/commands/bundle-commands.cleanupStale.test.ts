@@ -1,14 +1,16 @@
 /**
- * BundleCommands.cleanupStaleLockfileEntries contract tests (W13; BR12.2, BR12.5).
+ * BundleCommands.cleanupStaleLockfileEntries contract tests (W13; BR12.2,
+ * BR12.5, BR21.5).
  *
- * Stale rows come from both install record files, for any tool, and from the
- * old `prompt-registry` lockfiles; a row is offered only when every file it
- * lists is missing. Confirming removes the entries only, never a file. A
- * `RECORD.*` error mid-batch stops the batch and one message names what was
- * removed and what was not attempted. Records are written through
- * `InstallRecordService` and the old lockfile through app's `writeLockfile`,
- * in a real temp git root; only `RegistryStorage`, `getWorkspaceRoot()` and
- * the VS Code notification API are stubbed.
+ * The old `prompt-registry` lockfiles are migrated first; stale rows then
+ * come from both install record files, for any tool but `unknown`, and a row
+ * is offered only when it lists files and every one of them is missing.
+ * Confirming removes the entries only, never a file. A `RECORD.*` error
+ * mid-batch stops the batch and one message names what was removed and what
+ * was not attempted. Records are written through `InstallRecordService` and
+ * the old lockfile through app's `writeLockfile`, in a real temp git root;
+ * only `RegistryStorage`, `getWorkspaceRoot()` and the VS Code notification
+ * API are stubbed.
  */
 
 import * as assert from 'node:assert';
@@ -112,10 +114,11 @@ suite('BundleCommands.cleanupStaleLockfileEntries', () => {
     cleanupTestWorkspace(root);
   });
 
-  test('removes entries with all files missing for any tool and the old lockfile; keeps a partly missing entry and every file', async () => {
+  test('migrates the old lockfile first, then removes entries with all files missing for any tool; never offers an unknown or file-less entry (BR21.5)', async () => {
     await recordBundle('stale-vscode', 'vscode', ['.github/prompts/stale-vscode.prompt.md']);
     await recordBundle('stale-kiro', 'kiro', ['.kiro/steering/stale-kiro.md']);
     await recordBundle('partial', 'vscode', ['.github/prompts/partial-a.prompt.md', '.github/prompts/partial-b.prompt.md'], ['.github/prompts/partial-a.prompt.md']);
+    await recordBundle('no-files', 'vscode', []);
     const oldLock = upsertBundleEntry(emptyLockfile('prompt-registry@1.0.0'), 'old-stale', {
       version: '1.0.0', sourceId: 'acme-github', sourceType: 'github', installedAt: '2026-10-28T10:00:00.000Z',
       files: [{ path: '.github/prompts/old-stale.prompt.md', checksum: '0'.repeat(64) }]
@@ -125,14 +128,18 @@ suite('BundleCommands.cleanupStaleLockfileEntries', () => {
     await commands.cleanupStaleLockfileEntries();
 
     const offered = String(showWarning.firstCall.args[0]);
-    for (const label of ['stale-vscode (vscode)', 'stale-kiro (kiro)', 'old-stale (old lockfile)']) {
+    for (const label of ['stale-vscode (vscode)', 'stale-kiro (kiro)']) {
       assert.ok(offered.includes(label), offered);
     }
-    assert.ok(!offered.includes('partial'), offered);
-    assert.deepStrictEqual(Object.keys(readJson(RECORD_FILE).bundles), ['partial']);
-    assert.ok(!exists(OLD_LOCKFILE), 'the emptied old lockfile is removed');
+    for (const bundleId of ['partial', 'no-files', 'old-stale']) {
+      assert.ok(!offered.includes(bundleId), offered);
+    }
+    const bundles = readJson(RECORD_FILE).bundles;
+    assert.deepStrictEqual(Object.keys(bundles).toSorted(), ['no-files', 'old-stale', 'partial']);
+    assert.deepStrictEqual(Object.keys(bundles['old-stale'].tools), ['unknown'], 'the old entry was migrated, not removed');
+    assert.ok(!exists(OLD_LOCKFILE), 'the old lockfile was migrated');
     assert.ok(exists('.github/prompts/partial-b.prompt.md'), 'no file is deleted');
-    assert.ok(String(showInfo.lastCall.args[0]).includes('Successfully removed 3'));
+    assert.ok(String(showInfo.lastCall.args[0]).includes('Successfully removed 2'));
   });
 
   test('a malformed record file mid-batch stops the batch and reports removed and not-attempted rows', async () => {
