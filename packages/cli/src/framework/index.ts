@@ -105,6 +105,8 @@ export {
   prepareRecordSelection,
   prepareRepositoryRecord,
   prepareRepositoryUninstall,
+  prepareUserRecord,
+  prepareUserUninstall,
   recordOutputFields,
   recordRepositoryInstall,
   recordRepositoryUninstall,

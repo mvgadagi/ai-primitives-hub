@@ -71,6 +71,7 @@ import {
   type PreparedRepositoryUninstall,
   prepareRecordSelection,
   prepareRepositoryUninstall,
+  prepareUserUninstall,
   readTargetsSafely,
   recordOutputFields,
   recordRepositoryUninstall,
@@ -144,7 +145,7 @@ async function detectUninstallContext(opts: UninstallOptions, ctx: Context): Pro
  */
 async function refuseMultiToolUninstall(ctx: Context, bundleId: string, scope?: UninstallOptions['scope']): Promise<void> {
   const { selection, service } = await prepareRecordSelection(ctx, { command: 'uninstall', scope });
-  if (selection.level !== 'repository') {
+  if (selection.level !== 'repository' && (selection.level !== 'user' || selection.locations.length === 0)) {
     return;
   }
   const tools = [...new Set((await service.listEntries(selection.locations))
@@ -383,20 +384,22 @@ export async function runUserScopeUninstall(
  * @param target Target being uninstalled from.
  * @param ctx CLI context.
  * @param writer Target writer.
+ * @param exclude Bundle ids already uninstalled from the user record, left alone here.
  * @returns Uninstall results, one per bundle removed.
  */
 async function runAllUserScopeUninstall(
   lockPath: string,
   target: Target,
   ctx: Context,
-  writer: TargetWriter
+  writer: TargetWriter,
+  exclude: ReadonlySet<string> = new Set()
 ): Promise<UninstallResult[]> {
   const lock = await readLockfile(lockPath, ctx.fs);
   if (lock === null) {
     return [];
   }
   const results: UninstallResult[] = [];
-  for (const bundleId of Object.keys(lock.bundles)) {
+  for (const bundleId of Object.keys(lock.bundles).filter((id) => !exclude.has(id))) {
     results.push(await runUserScopeUninstall(bundleId, lockPath, target, ctx, writer));
   }
   return results;
@@ -480,11 +483,13 @@ async function performBundleUninstall(
   fmt: OutputFormat
 ): Promise<number> {
   const bundleId = opts.bundle as string;
-  if (target.scope === 'repository') {
-    // Both new record files are loaded first: a RECORD.* error stops here
+  if (target.scope === 'repository' || target.scope === 'user') {
+    // The new record files are loaded first: a RECORD.* error stops here
     // with nothing removed. A bundle recorded there for this target's type is
     // uninstalled from the record; any other falls back to the old store.
-    const prepared = await prepareRepositoryUninstall(ctx, target);
+    const prepared = target.scope === 'repository'
+      ? await prepareRepositoryUninstall(ctx, target)
+      : await prepareUserUninstall(ctx, target);
     const recordedFiles = prepared.entries.get(bundleId);
     if (recordedFiles !== undefined) {
       return await performRecordBundleUninstall({ opts, target, ctx, fmt }, prepared, bundleId, recordedFiles);
@@ -614,7 +619,7 @@ async function performRecordBundleUninstall(
     output: fmt,
     status: 'ok',
     data: {
-      level: 'repository' as const,
+      level: prepared.location.level,
       records: [recorded.lockfile],
       target: target.name,
       bundle: bundleId,
@@ -835,10 +840,16 @@ async function performAllUninstall(
   fmt: OutputFormat
 ): Promise<number> {
   // Repository scope: both new record files are loaded first (a RECORD.*
-  // error stops with nothing removed). Bundles recorded there for this
-  // target's type are uninstalled from the record; the old store is then
-  // handled as before, so bundles installed before the record still go.
-  const prepared = target.scope === 'repository' ? await prepareRepositoryUninstall(ctx, target) : undefined;
+  // error stops with nothing removed); user scope loads the user record the
+  // same way. Bundles recorded there for this target's type are uninstalled
+  // from the record; the old store is then handled as before, so bundles
+  // installed before the record still go.
+  let prepared: PreparedRepositoryUninstall | undefined;
+  if (target.scope === 'repository') {
+    prepared = await prepareRepositoryUninstall(ctx, target);
+  } else if (target.scope === 'user') {
+    prepared = await prepareUserUninstall(ctx, target);
+  }
   const recordedIds = prepared === undefined ? [] : [...prepared.entries.keys()];
   // An id uninstalled from the record is not removed again from the old
   // store, so each id is handled and reported once.
@@ -874,15 +885,14 @@ async function performAllUninstall(
   }
 
   const writerFactory = createWriterFactory(ctx, opts);
-  let results: UninstallResult[];
+  const results: UninstallResult[] = [];
   const warnings: string[] = [];
+  for (const bundleId of recordedIds) {
+    const recorded = await recordRepositoryUninstall(prepared as PreparedRepositoryUninstall, bundleId);
+    results.push({ bundleId, removed: recorded.removed, skipped: [] });
+    warnings.push(...recorded.warnings);
+  }
   if (target.scope === 'repository') {
-    results = [];
-    for (const bundleId of recordedIds) {
-      const recorded = await recordRepositoryUninstall(prepared as PreparedRepositoryUninstall, bundleId);
-      results.push({ bundleId, removed: recorded.removed, skipped: [] });
-      warnings.push(...recorded.warnings);
-    }
     const pipeline = new UninstallPipeline({
       fs: ctx.fs,
       target,
@@ -891,8 +901,9 @@ async function performAllUninstall(
     });
     results.push(...await pipeline.runAll({ exclude: recordedSet }));
   } else {
+    // Old user lockfile: bundles not uninstalled from the user record above.
     const lockPath = lockfilePathForTarget(ctx, target);
-    results = await runAllUserScopeUninstall(lockPath, target, ctx, writerFactory(target));
+    results.push(...await runAllUserScopeUninstall(lockPath, target, ctx, writerFactory(target), recordedSet));
   }
 
   if (results.length === 0) {
