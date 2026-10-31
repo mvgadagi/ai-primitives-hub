@@ -85,6 +85,11 @@ export class BundleScopeCommands {
         return;
       }
 
+      // The user level's older records are migrated first (BR18.1); a migrated
+      // `unknown` entry cannot be moved and asks for a reinstall (BR21.4)
+      await this.registryManager.migrateBeforeWrite('user');
+      await this.registryManager.assertHostTool(bundleId, 'user', 'move-to-repository');
+
       // Check if bundle is installed at user scope (RegistryStorage or the shared user record)
       const userBundle = await this.getBundleForScope(bundleId, 'user');
 
@@ -143,6 +148,9 @@ export class BundleScopeCommands {
         );
       }
     } catch (error) {
+      if (showCliManagedWarning(error)) {
+        return;
+      }
       await ErrorHandler.handle(error, {
         operation: 'move bundle to repository',
         showUserMessage: true,
@@ -161,7 +169,9 @@ export class BundleScopeCommands {
     try {
       this.logger.debug(`[BundleScopeCommands] Moving bundle ${bundleId} to user scope`);
 
-      // CLI-installed items are refused before any lookup or dialog (BR5.6)
+      // CLI-installed items are refused before any lookup or dialog (BR5.6),
+      // after the repository level's older records were migrated (BR18.1)
+      await this.registryManager.migrateBeforeWrite('repository');
       await this.registryManager.assertHostTool(bundleId, 'repository', 'move-to-user');
 
       // Get bundle from repository scope (uses lockfile)
@@ -239,7 +249,9 @@ export class BundleScopeCommands {
     try {
       this.logger.debug(`[BundleScopeCommands] Switching commit mode for ${bundleId} to ${newMode}`);
 
-      // CLI-installed items are refused before any lookup, dialog or exclude change (BR5.6)
+      // CLI-installed items are refused before any lookup, dialog or exclude change (BR5.6),
+      // after the repository level's older records were migrated (BR18.1)
+      await this.registryManager.migrateBeforeWrite('repository');
       await this.registryManager.assertHostTool(bundleId, 'repository', 'switch-commit-mode');
 
       // Get bundle from repository scope (uses lockfile)

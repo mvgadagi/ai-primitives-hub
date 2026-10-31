@@ -43,6 +43,7 @@ import type {
 } from '@ai-primitives-hub/core';
 import {
   relativeInside,
+  UNKNOWN_TOOL_NAME,
 } from '@ai-primitives-hub/core';
 import {
   ZipBundleExtractor,
@@ -260,8 +261,9 @@ export class BundleInstaller {
   /**
    * W9 steps 6–10 / W11: record the host tool's entry with the written files,
    * bring writer-group siblings along (BR11.6), report other siblings as out
-   * of date, retire the old `prompt-registry` entry (BR12.1), then delete the
-   * superseded files except modified ones (NFR4.13).
+   * of date, then delete the superseded files except modified ones (NFR4.13).
+   * Recording the host entry clears a migrated `unknown` entry of the bundle
+   * and keeps its files (BR21.2).
    * @param bundle - Installed bundle.
    * @param prepared - Result of {@link prepareRepositoryInstall}.
    * @param written - Absolute paths the writer wrote.
@@ -276,7 +278,6 @@ export class BundleInstaller {
     inPlace?: RepositoryUpdateInPlace
   ): Promise<void> {
     const group = writerGroupFor(this.records.hostTool, routeKeys);
-    const root = prepared.location.root;
     const warnings = await this.recordHostInstall(bundle, {
       location: prepared.location,
       source: prepared.source,
@@ -287,9 +288,8 @@ export class BundleInstaller {
         ? undefined
         : { bundleId: inPlace.previousBundleId, location: inPlace.location, deleteFilesNow: true },
       modified: inPlace?.modified ?? new Set<string>()
-    }, async (change) => {
+    }, (change) => {
       this.reportOutOfDateSiblings(bundle.id, change.siblings);
-      await this.retireOldEntry(prepared.workspaceRoot, bundle.id, root);
     });
     this.logWarnings(warnings);
     this.logger.debug(`Recorded ${bundle.id} for ${this.records.hostTool} in ${prepared.location.path}`);
@@ -310,7 +310,7 @@ export class BundleInstaller {
   private async recordHostInstall(
     bundle: Bundle,
     input: HostInstallToRecord,
-    beforeDelete?: (change: RecordInstallResult) => Promise<void>
+    beforeDelete?: (change: RecordInstallResult) => Promise<void> | void
   ): Promise<string[]> {
     const root = input.location.root;
     const tool = this.records.hostTool;
@@ -367,18 +367,46 @@ export class BundleInstaller {
   }
 
   /**
-   * Retire the old `prompt-registry` entry of a bundle after the record was saved (BR12.1).
-   * @param workspaceRoot - Workspace folder.
-   * @param bundleId - Bundle id.
-   * @param root - Record root, for "Open file".
+   * The bundle's `unknown` entry when it is its only entry at the item's level
+   * (BR21.4): a migrated bundle no tool has reinstalled yet. Only repository
+   * items and user items of the shared user record have one.
+   * @param installed - The item.
+   * @throws {RegistryError} Any `RECORD.*` error from loading, after it was shown once.
    */
-  private async retireOldEntry(workspaceRoot: string, bundleId: string, root: string): Promise<void> {
+  private async findLoneUnknownEntry(installed: InstalledBundle): Promise<LocatedToolEntry | undefined> {
     try {
-      const retired = await this.records.retireOldEntry(workspaceRoot, bundleId);
-      this.logWarnings(retired?.warnings ?? []);
+      if (installed.scope === 'repository') {
+        const workspaceRoot = getWorkspaceRoot();
+        return workspaceRoot ? await this.records.findLoneUnknownEntry(installed.bundleId, workspaceRoot) : undefined;
+      }
+      if (installed.scope === 'user' && installed.recordOrigin === 'install-record' && this.records.usesSharedUserRecord()) {
+        return await this.records.findLoneUnknownEntry(installed.bundleId);
+      }
+      return undefined;
     } catch (error) {
-      this.rethrowRecordError(error, [], root);
+      this.rethrowRecordError(error);
     }
+  }
+
+  /**
+   * Uninstall of a lone `unknown` entry (BR21.4): remove the entry and keep
+   * every file it lists, since no tool is known to own them; the message
+   * names the files kept.
+   * @param bundleId - Bundle id.
+   * @param located - The `unknown` entry.
+   */
+  private async removeUnknownEntry(bundleId: string, located: LocatedToolEntry): Promise<void> {
+    const root = located.location.root;
+    const change = await this.records.serialize(located.location.path, () =>
+      this.records.service.recordUninstall({ location: located.location, bundleId, tool: UNKNOWN_TOOL_NAME })
+    ).catch((error: unknown) => this.rethrowRecordError(error, [], root));
+    change.warnings.forEach((warning) => this.logger.warn(`[BundleInstaller] ${warning}`));
+    const kept = located.entry.files.map((file) => file.path);
+    const message = kept.length === 0
+      ? `"${bundleId}" was removed from the install record. Its tool was unknown; it listed no files.`
+      : `"${bundleId}" was removed from the install record. Its tool was unknown, so its files were kept: ${kept.join(', ')}`;
+    this.logger.info(`[BundleInstaller] ${message}`);
+    void vscode.window.showInformationMessage(message);
   }
 
   /**
@@ -1234,11 +1262,11 @@ export class BundleInstaller {
 
   /**
    * Uninstall a bundle. At repository scope the host tool's record entry is
-   * removed and its files deleted, except shared and modified ones (W10); a
-   * bundle only the old lockfile holds leaves it the same way (BR12.1). At
+   * removed and its files deleted, except shared and modified ones (W10). At
    * user scope the shared user record is used the same way when it holds the
    * host tool's entry (BR16.x); otherwise the RegistryStorage installation is
-   * uninstalled as before.
+   * uninstalled as before. A migrated bundle whose only entry is `unknown`
+   * loses that entry and keeps its files (BR21.4).
    * @param installed
    * @throws {RegistryError} A `RECORD.*` error, after it was shown once.
    */
@@ -1246,6 +1274,12 @@ export class BundleInstaller {
     this.logger.info(`Uninstalling bundle: ${installed.bundleId}`);
 
     try {
+      const unknown = await this.findLoneUnknownEntry(installed);
+      if (unknown !== undefined) {
+        await this.removeUnknownEntry(installed.bundleId, unknown);
+        return;
+      }
+
       // A user item on the shared user record: the host tool's entry, if any (BR16.x).
       const userEntry = await this.findUserRecordEntry(installed, 'uninstall');
 
@@ -1313,6 +1347,18 @@ export class BundleInstaller {
 
     try {
       const resolvedSourceType = sourceType ?? installed.sourceType;
+      const unknown = await this.findLoneUnknownEntry(installed);
+      if (unknown !== undefined) {
+        // A host-tool install clears the migrated `unknown` entry and keeps its files (BR21.2, BR21.4).
+        const updated = await this.installFromBuffer(
+          bundle,
+          bundleBuffer,
+          { scope: installed.scope, version: bundle.version, commitMode: unknown.location.commitMode, profileId: installed.profileId },
+          resolvedSourceType
+        );
+        this.logger.info('Bundle updated successfully');
+        return updated;
+      }
       if (installed.scope === 'repository') {
         return await this.updateRepositoryInPlace(installed, bundle, bundleBuffer, resolvedSourceType);
       }
