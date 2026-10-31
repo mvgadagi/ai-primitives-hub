@@ -9,6 +9,7 @@ import {
 import {
   isRecordError,
   type RecordLocation,
+  UNKNOWN_TOOL_NAME,
 } from '@ai-primitives-hub/core';
 import * as vscode from 'vscode';
 import {
@@ -33,14 +34,11 @@ import {
   BundleUpdateCommands,
 } from './bundle-update-commands';
 
-/**
- * A stale repository entry: a record tool entry (with `tool` and `location`)
- * or an old lockfile entry (neither).
- */
+/** A stale repository entry: one tool entry of a record file. */
 interface StaleRow {
   bundleId: string;
-  tool?: string;
-  location?: RecordLocation;
+  tool: string;
+  location: RecordLocation;
 }
 
 /**
@@ -69,13 +67,15 @@ export class BundleCommands {
    * @param row - Stale row.
    */
   private static rowLabel(row: StaleRow): string {
-    return row.tool === undefined ? `${row.bundleId} (old lockfile)` : `${row.bundleId} (${row.tool})`;
+    return `${row.bundleId} (${row.tool})`;
   }
 
   /**
-   * Stale rows of a workspace folder (BR12.2): one per bundle and tool entry
-   * of both record files, and one per old lockfile entry, offered only when
-   * every file the row lists is missing (app `areAllFilesMissing`).
+   * Stale rows of a workspace folder (BR12.2, BR21.5): one per bundle and
+   * tool entry of both record files, offered only when the entry lists files
+   * and every one of them is missing (app `areAllFilesMissing`). A migrated
+   * `unknown` entry is never offered; it is on the reinstall list. The caller
+   * migrates the old lockfiles first, so the rows come from the records only.
    * @param workspaceRoot - Absolute workspace folder path.
    * @throws {RegistryError} Any `RECORD.*` error from loading the record files.
    */
@@ -83,16 +83,11 @@ export class BundleCommands {
     const adapter = this.registryManager.getRecordAdapter();
     const rows: StaleRow[] = [];
     for (const located of await adapter.listAllEntries(workspaceRoot)) {
+      if (located.tool === UNKNOWN_TOOL_NAME || located.entry.files.length === 0) {
+        continue;
+      }
       if (await areAllFilesMissing(adapter.fs, located.location.root, located.entry.files.map((file) => file.path))) {
         rows.push({ bundleId: located.bundleId, tool: located.tool, location: located.location });
-      }
-    }
-    for (const old of await adapter.readOldLockfiles(workspaceRoot)) {
-      for (const [bundleId, entry] of Object.entries(old.lock?.bundles ?? {})) {
-        const paths = entry.files.map((file) => file.path.replaceAll('\\', '/'));
-        if (await areAllFilesMissing(adapter.fs, workspaceRoot, paths)) {
-          rows.push({ bundleId });
-        }
       }
     }
     return rows;
@@ -209,10 +204,11 @@ export class BundleCommands {
 
   /**
    * Clean up stale repository entries whose files are all missing (W13;
-   * BR12.2, BR12.5). Rows come from both record files and the old lockfiles,
-   * for any tool. On confirm only the entries are removed: no file is
-   * deleted, since none is left. The batch stops at the first `RECORD.*`
-   * error and one message names the removed and not-attempted rows.
+   * BR12.2, BR12.5, BR21.5). The old lockfiles are migrated first; rows then
+   * come from both record files, for any tool but `unknown`. On confirm only
+   * the entries are removed: no file is deleted, since none is left. The
+   * batch stops at the first `RECORD.*` error and one message names the
+   * removed and not-attempted rows.
    */
   public async cleanupStaleLockfileEntries(): Promise<void> {
     const workspaceRoot = getWorkspaceRoot();
@@ -224,6 +220,7 @@ export class BundleCommands {
 
     const adapter = this.registryManager.getRecordAdapter();
     try {
+      await adapter.migrateBeforeWrite('repository', workspaceRoot);
       const staleRows = await this.findStaleRows(workspaceRoot);
 
       if (staleRows.length === 0) {
@@ -245,9 +242,7 @@ export class BundleCommands {
       const done: string[] = [];
       for (const [index, row] of staleRows.entries()) {
         try {
-          await (row.location === undefined || row.tool === undefined
-            ? adapter.removeOldEntry(workspaceRoot, row.bundleId)
-            : adapter.service.recordUninstall({ location: row.location, bundleId: row.bundleId, tool: row.tool }));
+          await adapter.service.recordUninstall({ location: row.location, bundleId: row.bundleId, tool: row.tool });
           done.push(BundleCommands.rowLabel(row));
           this.logger.info(`Removed stale entry: ${BundleCommands.rowLabel(row)}`);
         } catch (error) {

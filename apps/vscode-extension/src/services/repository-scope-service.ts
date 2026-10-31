@@ -716,23 +716,6 @@ export class RepositoryScopeService implements IScopeService {
   }
 
   /**
-   * Remove a bundle's entry from the old `prompt-registry` lockfile, with its
-   * files (BR12.1).
-   * @param bundleId - Bundle id.
-   * @returns Whether an old entry existed.
-   */
-  private async unsyncOldEntry(bundleId: string): Promise<boolean> {
-    const retired = await this.records.retireOldEntry(this.workspaceRoot, bundleId);
-    if (retired === undefined) {
-      return false;
-    }
-    retired.warnings.forEach((warning) => this.logger.warn(`[RepositoryScopeService] ${warning}`));
-    await this.afterFilesRemoved(true, retired.deleted, retired.kept);
-    this.logger.info(`[RepositoryScopeService] ✅ Removed ${retired.deleted.length} old-lockfile files for bundle: ${bundleId}`);
-    return true;
-  }
-
-  /**
    * Exclude cleanup, empty-folder cleanup and the log line after an uninstall.
    * @param wasLocalOnly - Whether removed paths may be in `info/exclude`.
    * @param deleted - Workspace-relative removed paths.
@@ -757,55 +740,6 @@ export class RepositoryScopeService implements IScopeService {
    */
   private fromRootRelative(root: string, recordedPath: string): string {
     return path.relative(this.workspaceRoot, path.join(root, ...recordedPath.split('/'))).split(path.sep).join('/');
-  }
-
-  /**
-   * Today's commit-mode switch for a bundle only the old lockfile holds:
-   * exclude entries for the host's managed folders.
-   * @param bundleId - Bundle identifier
-   * @param newMode - New commit mode
-   */
-  private async switchOldCommitMode(bundleId: string, newMode: RepositoryCommitMode): Promise<void> {
-    const bundle = (await this.records.listOldBundles(this.workspaceRoot)).find((b) => b.bundleId === bundleId);
-    if (!bundle) {
-      this.logger.warn(`[RepositoryScopeService] Bundle ${bundleId} not found in any record or lockfile`);
-      return;
-    }
-    if ((bundle.commitMode ?? 'commit') === newMode) {
-      this.logger.debug(`[RepositoryScopeService] Bundle ${bundleId} already in ${newMode} mode`);
-      return;
-    }
-
-    // The old entry's files point to the bundle cache, not the installed
-    // location, so the host-aware destination folders are scanned (e.g.
-    // .github/* for VS Code, .kiro/* for Kiro). Kinds are deduped because
-    // several may resolve to the same folder (prompt + instructions -> .kiro/steering/).
-    const filePaths: string[] = [];
-    const scannedDirs = new Set<string>();
-    for (const kind of MANAGED_KINDS) {
-      const relativeDir = this.getTargetDirectory(kind).replace(/[/\\]+$/, '');
-      if (scannedDirs.has(relativeDir)) {
-        continue;
-      }
-      scannedDirs.add(relativeDir);
-      const absoluteDir = path.join(this.workspaceRoot, relativeDir);
-      if (!fs.existsSync(absoluteDir)) {
-        continue;
-      }
-      for (const entry of await readdir(absoluteDir)) {
-        filePaths.push(path.join(relativeDir, entry));
-      }
-    }
-
-    // VS Code-specific convention file (harmless no-op on other hosts).
-    if (fs.existsSync(path.join(this.workspaceRoot, '.github', 'copilot-instructions.md'))) {
-      filePaths.push('.github/copilot-instructions.md');
-    }
-
-    await (newMode === 'local-only' ? this.addToGitExclude(filePaths) : this.removeFromGitExclude(filePaths));
-    // Move the entry between the two old lockfiles (app `json-lockfile-store`).
-    await this.records.moveOldEntry(this.workspaceRoot, bundleId, newMode);
-    this.logger.info(`[RepositoryScopeService] ✅ Switched ${bundleId} to ${newMode} mode`);
   }
 
   /**
@@ -915,9 +849,9 @@ export class RepositoryScopeService implements IScopeService {
    * entry still lists (`keptSharedFiles`); files whose content no longer
    * matches the recorded checksum, or that are missing, are kept too
    * (`findModifiedFiles`, NFR4.13); the rest go through `deleteSuperseded`.
-   * A bundle only the old `prompt-registry` lockfile holds is removed from it
-   * the same way (BR12.1), keeping paths any record entry lists; after a
-   * record uninstall, an old entry for the same bundle is retired as well.
+   * Older records are migrated before any write (BR18.1), so no old
+   * `prompt-registry` file is changed here; a migrated `unknown` entry is
+   * removed by `BundleInstaller` without deleting files (BR21.4).
    * @param bundleId - The unique identifier of the bundle to unsync
    * @throws {RegistryError} Any `RECORD.*` error; the record and files are unchanged when loading fails.
    */
@@ -926,9 +860,7 @@ export class RepositoryScopeService implements IScopeService {
       this.logger.debug(`[RepositoryScopeService] Removing files for bundle: ${bundleId}`);
       const located = await this.records.findHostEntry(this.workspaceRoot, bundleId);
       if (located === undefined) {
-        if (!await this.unsyncOldEntry(bundleId)) {
-          this.logger.debug(`[RepositoryScopeService] Bundle ${bundleId} not found in any record or lockfile`);
-        }
+        this.logger.debug(`[RepositoryScopeService] Bundle ${bundleId} has no ${this.records.hostTool} entry in the install record`);
         return;
       }
       const { location, entry } = located;
@@ -944,9 +876,6 @@ export class RepositoryScopeService implements IScopeService {
       const kept = [...change.keptSharedFiles, ...[...modified].filter((file) => change.deletedFiles.includes(file))];
       await this.afterFilesRemoved(location.commitMode === 'local-only', removal.deleted.map((file) => this.fromRootRelative(location.root, file)), kept);
       this.logger.info(`[RepositoryScopeService] ✅ Removed ${removal.deleted.length} files for bundle: ${bundleId}`);
-      // Uninstall removes both (BR12.1): an old entry for the same bundle is
-      // retired too, keeping every path a record entry still lists or that was modified.
-      await this.unsyncOldEntry(bundleId);
     } catch (error) {
       if (isRecordError(error)) {
         throw error;
@@ -961,8 +890,8 @@ export class RepositoryScopeService implements IScopeService {
    * A host-tool record entry moves unchanged to the other record file
    * (`moveEntry`). Its paths are added to `info/exclude` only when no
    * committed entry lists them, and removed only when no local-only entry
-   * lists them. A bundle only the old lockfile holds keeps today's
-   * folder-scan exclude update; the caller updates the old file.
+   * lists them. Older records are migrated first (BR18.1), and a migrated
+   * `unknown` entry is refused before this runs (BR21.4).
    * @param bundleId - Bundle identifier
    * @param newMode - New commit mode
    * @throws {RegistryError} Any `RECORD.*` error.
@@ -972,7 +901,7 @@ export class RepositoryScopeService implements IScopeService {
       this.logger.debug(`[RepositoryScopeService] Switching commit mode for ${bundleId} to ${newMode}`);
       const located = await this.records.findHostEntry(this.workspaceRoot, bundleId);
       if (located === undefined) {
-        await this.switchOldCommitMode(bundleId, newMode);
+        this.logger.warn(`[RepositoryScopeService] Bundle ${bundleId} has no ${this.records.hostTool} entry in the install record`);
         return;
       }
       if ((located.location.commitMode ?? 'commit') === newMode) {

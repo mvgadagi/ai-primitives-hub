@@ -19,17 +19,18 @@ import {
 import * as vscode from 'vscode';
 
 /** Extension actions guarded for repository entries of another tool. */
-export type CliManagedAction = 'update' | 'uninstall' | 'move-to-user' | 'switch-commit-mode';
+export type CliManagedAction = 'update' | 'uninstall' | 'move-to-user' | 'move-to-repository' | 'switch-commit-mode';
 
 /**
  * The CLI command that does the refused action for another tool. Moving to
- * user scope starts with an uninstall at repository level; a commit-mode
- * switch is a reinstall with the other mode.
+ * user or repository scope starts with an uninstall at the level it leaves; a
+ * commit-mode switch is a reinstall with the other mode.
  */
 const CLI_COMMANDS: Readonly<Record<CliManagedAction, string>> = {
   update: 'update',
   uninstall: 'uninstall',
   'move-to-user': 'uninstall',
+  'move-to-repository': 'uninstall',
   'switch-commit-mode': 'install'
 };
 
