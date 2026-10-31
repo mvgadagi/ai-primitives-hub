@@ -1081,11 +1081,7 @@
     "package:full": "pnpm run package:prepare && pnpm run package:vsix && pnpm run package:cleanup",
     "package:production": "pnpm run package:prepare && pnpm run package:vsix && pnpm run package:cleanup && echo \"📦 Production package created with optimized size\"",
     "dev:setup": "pnpm run ignore:dev && echo \"🔧 Development mode activated - Copilot friendly\"",
-    "dev:package-test": "pnpm run package:prepare && echo \"📋 Switched to production mode - check file exclusions\" && pnpm run ignore:status",
-    "version:update": "./scripts/update-version.sh",
-    "version:bump:major": "npm version major --no-git-tag-version && pnpm run version:update",
-    "version:bump:minor": "npm version minor --no-git-tag-version && pnpm run version:update",
-    "version:bump:patch": "npm version patch --no-git-tag-version && pnpm run version:update"
+    "dev:package-test": "pnpm run package:prepare && echo \"📋 Switched to production mode - check file exclusions\" && pnpm run ignore:status"
   },
   "devDependencies": {
     "@design-factory/styles": "^22.0.0",

@@ -160,11 +160,13 @@ open coverage/index.html
 | `pnpm run coverage:clean` | Clean coverage reports |
 
 ### Version Management
+Run these from the repository root. Versions are bumped only by the release
+workflow; see [Release Process](./releasing.md).
+
 | Command | Description |
 |---------|-------------|
-| `pnpm run version:bump:patch` | Bump patch version (0.0.X) |
-| `pnpm run version:bump:minor` | Bump minor version (0.X.0) |
-| `pnpm run version:bump:major` | Bump major version (X.0.0) |
+| `pnpm run version:check` | Check that the packages and the extension share one version |
+| `pnpm run test:scripts` | Test the version scripts |
 
 ## 🚨 Common Issues & Solutions
 
@@ -243,21 +245,17 @@ git push origin feature/new-feature
 
 ### Example 3: Pre-Release Checklist
 ```bash
-# 1. Bump version
-pnpm run version:bump:minor
-
-# 2. Full validation
+# 1. Full validation
 ./.github/workflows/scripts/validate-locally.sh
 
-# 3. Create production package
+# 2. Create production package
 pnpm run package:full
 
-# 4. Test the VSIX locally
+# 3. Test the VSIX locally
 code --install-extension *.vsix
 
-# 5. Tag for release (publication happens via GitHub Actions)
-git tag v0.2.0
-git push --tags
+# 4. Release: run the "Release AI Primitives Hub" workflow from main
+#    (see docs/contributor-guide/releasing.md); it bumps the version and tags it
 ```
 
 **Note:** Creating a GitHub release triggers automatic publication and should be done after proper validation. See [Release Process](./releasing.md) for publication workflow.
