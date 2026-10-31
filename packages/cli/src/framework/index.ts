@@ -105,6 +105,8 @@ export {
   prepareRecordSelection,
   prepareRepositoryRecord,
   prepareRepositoryUninstall,
+  prepareUserRecord,
+  prepareUserUninstall,
   recordOutputFields,
   recordRepositoryInstall,
   recordRepositoryUninstall,
@@ -113,6 +115,7 @@ export {
   toInstallRecordError,
   toLockfileBundleEntry,
   toLockfileSourceEntry,
+  writerEnv,
 } from './install-record';
 export type {
   CreateHubManagerOptions,

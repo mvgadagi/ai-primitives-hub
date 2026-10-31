@@ -98,6 +98,7 @@ import {
   resolveTargetName,
   toLockfileBundleEntry,
   toLockfileSourceEntry,
+  writerEnv,
 } from '../framework';
 
 /**
@@ -258,7 +259,7 @@ export class UpdateCommand extends BaseUpdateCommand {
       // Select the record first: every selected file is loaded and checked
       // before anything is fetched or written (W5 step 1, NFR4.8).
       const prepared = await prepareRecordSelection(ctx, { command: 'update', lockfile: this.lockfile, scope: opts.scope }, target);
-      if (prepared.selection.level === 'repository' && prepared.selection.locations.length > 0) {
+      if (prepared.selection.locations.length > 0) {
         const rows = await prepared.service.listEntries(prepared.selection.locations);
         if (rows.length > 0) {
           if (!this.noHubSync) {
@@ -595,7 +596,7 @@ function writerFor(ctx: Context, target: Target, scope: string, commitMode: Repo
     fs: ctx.fs,
     userConfigDir: resolveUserConfigDir(ctx.env)
   });
-  return new FileTreeTargetWriter({ fs: ctx.fs, env: ctx.env, transformer, layoutLoader });
+  return new FileTreeTargetWriter({ fs: ctx.fs, env: writerEnv(ctx.env, effectiveScope), transformer, layoutLoader });
 }
 
 async function applyUpdates(
@@ -941,7 +942,8 @@ async function applyRecordUpdate(
       source,
       sourceType: item.source.type,
       writtenPaths: await writeForTarget(ctx, target, files, manifest),
-      workspaceRoot: target.rootPath ?? ctx.cwd(),
+      // User level: home is the workspace root, as the user-scope install records it.
+      workspaceRoot: prepared.selection.level === 'user' ? prepared.selection.root : (target.rootPath ?? ctx.cwd()),
       syncSiblings
     });
   const change = await record(item.tool, item.location, item.target, (sibling) => siblingTargets.has(sibling));

@@ -273,6 +273,8 @@ export class RecordStore {
         target = await this.resolveAllowedLink(location, file);
       }
       temp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
+      // The user record's folder may not exist yet on a new machine (NFR7.4).
+      await this.fs.mkdir(path.dirname(target), { recursive: true });
       await this.fs.writeFile(temp, text);
       await this.fs.rename(temp, target);
     } catch (error) {
@@ -298,6 +300,18 @@ export class RecordStore {
       { level: 'repository', root, path: path.join(root, RECORD_FILE_NAME), commitMode: 'commit' },
       { level: 'repository', root, path: path.join(root, LOCAL_RECORD_FILE_NAME), commitMode: 'local-only' }
     ];
+  }
+
+  /**
+   * The user-level record location (BR14.2): one file per machine, rooted at
+   * the home folder, with no commit mode and no git exclude.
+   * @param input - Home folder and record file.
+   * @param input.home - Absolute home folder; the root every user-level path is relative to (BR14.3).
+   * @param input.path - Absolute path of the user record (`AppStoragePaths.userRecord`).
+   * @returns The user location.
+   */
+  public resolveUser(input: { home: string; path: string }): RecordLocation {
+    return { level: 'user', root: input.home, path: input.path };
   }
 
   /**

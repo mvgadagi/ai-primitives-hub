@@ -105,6 +105,7 @@ import {
   type PreparedRecordSelection,
   prepareRecordSelection,
   prepareRepositoryRecord,
+  prepareUserRecord,
   readTargetsSafely,
   recordOutputFields,
   recordRepositoryInstall,
@@ -118,6 +119,7 @@ import {
   toLockfileBundleEntry,
   toLockfileSourceEntry,
   validateInputs,
+  writerEnv,
 } from '../framework';
 
 /**
@@ -591,8 +593,7 @@ async function detectInstallContext(opts: InstallOptions, ctx: Context): Promise
 
   if (noMode && !opts.interactive) {
     const prepared = await prepareRecordSelection(ctx, { command: 'install', scope: opts.scope });
-    if (prepared.selection.level === 'repository'
-      && (await prepared.service.listEntries(prepared.selection.locations)).length > 0) {
+    if ((await prepared.service.listEntries(prepared.selection.locations)).length > 0) {
       return prepared;
     }
     const found = await findProjectLockfile(ctx);
@@ -765,7 +766,7 @@ export const createWriterFactory = (
     const transformer = transformerRegistry.getTransformer(effectiveTarget.type);
     return new FileTreeTargetWriter({
       fs: ctx.fs,
-      env: ctx.env,
+      env: writerEnv(ctx.env, scope),
       transformer,
       layoutLoader
     });
@@ -1059,9 +1060,11 @@ async function performLocalInstall(
     }
     // Repository scope: both record files are loaded and checked before the
     // writer runs, so a RECORD.* error stops here with nothing written (BR3.5).
+    // User scope: the shared user record is checked the same way, and a
+    // target folder outside home is refused (BR14.3).
     const prepared = effectiveTarget.scope === 'repository'
       ? await prepareRepositoryRecord(ctx, effectiveTarget)
-      : undefined;
+      : (effectiveTarget.scope === 'user' ? await prepareUserRecord(ctx, effectiveTarget) : undefined);
     const writerFactory = createWriterFactory(ctx, opts);
     const writer = writerFactory(effectiveTarget);
     const { installableFiles: targetFiles, result, skipped } = await writeBundleForInstall(
@@ -1404,7 +1407,8 @@ async function performRecordReplay(run: RecordReplayRun): Promise<number> {
         source: { sourceId: entry.sourceId, ...source },
         sourceType: entry.sourceType,
         writtenPaths: written,
-        workspaceRoot: target.rootPath ?? ctx.cwd(),
+        // User level: home is the workspace root, as the user-scope install records it.
+        workspaceRoot: selection.level === 'user' ? selection.root : (target.rootPath ?? ctx.cwd()),
         syncSiblings: false
       }));
       await updateTargetState(ctx, target.name, bundleId, manifest.version);
@@ -1622,9 +1626,10 @@ async function performRemoteInstall(
       return 0;
     }
     // Repository scope: check both record files before anything is written (BR3.5).
+    // User scope: check the shared user record and the target folder (BR14.3).
     const prepared = effectiveTarget.scope === 'repository'
       ? await prepareRepositoryRecord(ctx, effectiveTarget)
-      : undefined;
+      : (effectiveTarget.scope === 'user' ? await prepareUserRecord(ctx, effectiveTarget) : undefined);
     const writerFactory = createWriterFactory(ctx, opts);
     const writer = writerFactory(effectiveTarget);
     const { installableFiles: targetFiles, result, skipped } = await writeBundleForInstall(
