@@ -17,8 +17,8 @@ The install records shared by the CLI and the extension (format `3.0.0`,
 `ai-primitives-hub.lock.json` / `.local.lock.json` / `.user.lock.json`,
 ADR-0011) live in `src/records/` (`RecordStore`, `InstallRecordService`,
 `selectRecord`, `migrateRecords`). `src/stores/json-lockfile-store.ts` is
-the older 2.0.0 `prompt-registry.lock.json` store, kept for migration, the
-CLI's workspace scope and `profile activate`.
+the older 2.0.0 `prompt-registry.lock.json` store, kept for migration and
+the CLI's workspace scope.
 
 Also doubles as the public SDK surface (decision 2 in the migration plan)
 until a standalone `@ai-primitives-hub/sdk` package has a real external

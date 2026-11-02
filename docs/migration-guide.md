@@ -102,12 +102,11 @@ CLI `0.2.x` and extension releases before this change only know the `prompt-regi
 
 `init` no longer creates a lockfile. The first repository install creates `ai-primitives-hub.lock.json`; until then, `status` and a bare `install` in that repository use the user record.
 
-### Known limitation: `profile activate`
+### `profile activate`
 
-CLI `profile activate` (and `profile deactivate`) still use the older files, to be fixed in a follow-up:
+CLI `profile activate` and `profile deactivate` use the install record like `install` and `uninstall`: repository targets record in `ai-primitives-hub.lock.json` (or `.local.lock.json`), user targets in the user record. Workspace-scope targets keep the CLI's old user lockfile.
 
-- For repository targets they write `prompt-registry.lock.json` or `prompt-registry.local.lock.json`. The next record change in that repository migrates those bundles as `unknown` entries to reinstall.
-- For user targets they write the CLI's old user lockfile. Once the user record has imported that file (at the first user-level change), it is not read again at user level, so those bundles do not appear in user-level `status`, `update` or `uninstall`. Reinstall them with `install` to record them.
+A profile activated with an older release has its bundles in the older files, so after migration they are `unknown` entries. `profile deactivate` keeps those entries and their files and names them in a warning; activate the profile again to record them for the target's tool, or remove them with `ai-primitives-hub uninstall <bundle-id>`.
 
 ### Rolling back
 
