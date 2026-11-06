@@ -297,10 +297,11 @@ const copyRecordedFile = (file: RecordedFile): RecordedFile => {
 };
 
 /**
- * Every installed path listed by any entry of the given records.
+ * Every installed path listed by any entry of the given records (keep-if-listed, NFR4.9).
  * @param records - Records to scan.
+ * @returns The root-relative paths.
  */
-const listedPaths = (records: readonly InstallRecord[]): Set<string> => {
+export const listedPaths = (records: readonly InstallRecord[]): Set<string> => {
   const listed = new Set<string>();
   for (const record of records) {
     for (const bundle of Object.values(record.bundles)) {
