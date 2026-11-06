@@ -31,7 +31,6 @@ import {
   selectRecord,
 } from '@ai-primitives-hub/app';
 import {
-  compareCodeUnits,
   DEFAULT_LOCAL_HUB_ID,
   describeRecordError,
   type InstallationScope,
@@ -152,49 +151,70 @@ export const toInstallRecordError = (error: RegistryError, written?: readonly st
 const createRecordServices = (fs: RecordFs): InstallRecordServices =>
   createInstallRecordServices({ generatedBy: CLI_RECORD_GENERATED_BY, fs });
 
-/** Both repository record files for a target, and the one its commit mode names. */
+/**
+ * The `info/exclude` section at a git root, in the file app's
+ * `resolveExcludeFile` finds (following `gitdir:` and `commondir` in a
+ * worktree), so a writer's local-only entries and the local-only record's
+ * entry share one file (NFR4.6).
+ * @param ctx - CLI context; its filesystem edits the file.
+ * @param fs - Record filesystem port, to find the file.
+ * @param gitRoot - Git root (the record root); exclude patterns are relative to it.
+ * @returns The exclusion, or `undefined` without a trusted git directory: the
+ * writer then keeps its default, `<workspace>/.git/info/exclude`, and the
+ * record store warns about it on save.
+ */
+const recordExclusion = async (ctx: Context, fs: RecordFs, gitRoot: string): Promise<RepositoryExclusion | undefined> => {
+  const excludeFile = await resolveExcludeFile(fs, gitRoot).catch(() => ({ warning: 'unreadable' }));
+  return 'file' in excludeFile
+    ? new GitInfoExclude({ fs: ctx.fs, workspaceRoot: gitRoot, excludePath: excludeFile.file })
+    : undefined;
+};
+
+/** The repository record files a target acts on, and the one it records in. */
 interface RepositoryRecords extends InstallRecordServices {
   /** Workspace root the writer installs into (where merged MCP config files sit). */
   workspaceRoot: string;
-  /** The committed record file at the git root. */
-  committed: RecordLocation;
-  /** The local-only record file at the git root. */
-  localOnly: RecordLocation;
-  /** The file the target's commit mode names (BR2.2). */
+  /** The record files: both files at the git root (committed first), or the ones given. */
+  locations: readonly RecordLocation[];
+  /** The file the target's commit mode names (BR2.2), or the first one given. */
   location: RecordLocation;
-  /** The `info/exclude` section at the git root, in the file the record store uses (NFR4.6). */
+  /** The `info/exclude` section at the record root, in the file the record store uses (NFR4.6). */
   exclusion: RepositoryExclusion;
 }
 
 /**
- * Build the record services and locate both repository record files for a
+ * Build the record services and locate the repository record files for a
  * repository-scope target (BR2.1, BR2.2). Loads nothing.
- *
- * The exclusion edits the `info/exclude` file app's `resolveExcludeFile`
- * finds (following `gitdir:` and `commondir` in a worktree), so the installed
- * files' entries and the local-only record's entry share one file. Without a
- * trusted git directory it keeps the writer's default, `<workspace>/.git/info/exclude`.
  * @param ctx - CLI context; `ctx.cwd()` is the fallback start folder.
  * @param target - Effective repository-scope target.
  * @param fs - Filesystem port.
+ * @param given - Record files already selected (`--lockfile`); both files at the target's git root otherwise.
  * @returns The services, the workspace root, the record locations and the exclusion.
  */
-const openRepositoryRecords = async (ctx: Context, target: Target, fs: RecordFs): Promise<RepositoryRecords> => {
+const openRepositoryRecords = async (
+  ctx: Context,
+  target: Target,
+  fs: RecordFs,
+  given?: readonly RecordLocation[]
+): Promise<RepositoryRecords> => {
   const services = createRecordServices(fs);
   const workspaceRoot = target.rootPath ?? ctx.cwd();
-  const [committed, localOnly] = await services.store.resolveRepository({ start: workspaceRoot });
-  // An unreadable `.git` keeps the default file; the record store warns about it on save.
-  const excludeFile = await resolveExcludeFile(fs, committed.root).catch(() => ({ warning: 'unreadable' }));
+  let locations: readonly RecordLocation[];
+  let location: RecordLocation;
+  if (given === undefined || given.length === 0) {
+    const [committed, localOnly] = await services.store.resolveRepository({ start: workspaceRoot });
+    locations = [committed, localOnly];
+    location = target.commitMode === 'local-only' ? localOnly : committed;
+  } else {
+    locations = given;
+    location = given[0];
+  }
   return {
     ...services,
     workspaceRoot,
-    committed,
-    localOnly,
-    location: target.commitMode === 'local-only' ? localOnly : committed,
-    exclusion: 'file' in excludeFile
-      // Exclude patterns are relative to the work tree root, which is the record root.
-      ? new GitInfoExclude({ fs: ctx.fs, workspaceRoot: committed.root, excludePath: excludeFile.file })
-      : new GitInfoExclude({ fs: ctx.fs, workspaceRoot })
+    locations,
+    location,
+    exclusion: (await recordExclusion(ctx, fs, location.root)) ?? new GitInfoExclude({ fs: ctx.fs, workspaceRoot })
   };
 };
 
@@ -214,8 +234,9 @@ export const prepareRepositoryRecord = async (
 ): Promise<PreparedRepositoryRecord> => {
   try {
     const records = await openRepositoryRecords(ctx, target, fs);
-    await records.store.load(records.committed);
-    await records.store.load(records.localOnly);
+    for (const location of records.locations) {
+      await records.store.load(location);
+    }
     return {
       location: records.location,
       service: records.service,
@@ -299,6 +320,9 @@ export interface RecordedRepositoryUninstall {
  * map, so the caller can fall back to the old store for it.
  * @param ctx - CLI context; `ctx.cwd()` is the fallback start folder.
  * @param target - Effective repository-scope target.
+ * @param options - Record files already selected and checked (`uninstall --lockfile`);
+ * the first one is recorded in. Both files at the target's git root by default.
+ * @param options.locations - The selected record files.
  * @param fs - Filesystem port; `NodeRecordFs` unless a test passes one.
  * @returns The location, service, tool and the bundles recorded for that tool.
  * @throws {RegistryError} A `RECORD.*` error naming the file; nothing was removed.
@@ -306,28 +330,18 @@ export interface RecordedRepositoryUninstall {
 export const prepareRepositoryUninstall = async (
   ctx: Context,
   target: Target,
+  options: { locations?: readonly RecordLocation[] } = {},
   fs: RecordFs = new NodeRecordFs()
 ): Promise<PreparedRepositoryUninstall> => {
   try {
-    const { store, service, committed, localOnly, location, exclusion } = await openRepositoryRecords(ctx, target, fs);
-    const entries = new Map<string, string[]>();
-    for (const recordLocation of [committed, localOnly]) {
-      const { record } = await store.load(recordLocation);
-      for (const [bundleId, bundle] of Object.entries(record.bundles)) {
-        if (!Object.hasOwn(bundle.tools, target.type)) {
-          continue;
-        }
-        const paths = bundle.tools[target.type].files.map((file) => file.path);
-        entries.set(bundleId, [...new Set([...(entries.get(bundleId) ?? []), ...paths])]);
-      }
-    }
+    const { service, locations, location, exclusion } = await openRepositoryRecords(ctx, target, fs, options.locations);
     return {
       location,
       service,
       tool: target.type,
       // Same exclude file the install wrote the local-only entries to.
       exclusion,
-      entries: new Map([...entries].toSorted(([left], [right]) => compareCodeUnits(left, right)))
+      entries: await service.entriesForTool(locations, target.type)
     };
   } catch (error) {
     throw isRecordError(error) ? toCommandRecordError('uninstall', error) : error;
@@ -391,6 +405,13 @@ export interface PreparedRecordSelection {
   service: InstallRecordService;
   /** Filesystem port the store and service use. */
   fs: RecordFs;
+  /**
+   * `info/exclude` section at the selected repository record's root, for the
+   * writers of a replay or update, so their local-only entries go to the same
+   * file as the local-only record's (NFR4.6). Absent at user level and without
+   * a trusted git directory: the writer keeps its default.
+   */
+  exclusion?: RepositoryExclusion;
 }
 
 /**
@@ -425,7 +446,10 @@ export const prepareRecordSelection = async (
       findOldLockfile: (start) => findLockfile(start, ctx.fs, userLockfile),
       userLockfile
     });
-    return { selection, store, service, fs };
+    const exclusion = selection.level === 'repository' && selection.locations.length > 0
+      ? await recordExclusion(ctx, fs, selection.root)
+      : undefined;
+    return { selection, store, service, fs, ...(exclusion === undefined ? {} : { exclusion }) };
   } catch (error) {
     throw isRecordError(error) ? toCommandRecordError(input.command, error) : error;
   }
