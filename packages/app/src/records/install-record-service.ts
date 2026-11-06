@@ -675,6 +675,29 @@ export class InstallRecordService {
   }
 
   /**
+   * The bundles with an entry for `tool` in any of the files, each mapped to
+   * its recorded root-relative paths (merged across the files), sorted by
+   * bundle id: what an uninstall for that tool would remove.
+   * @param locations - Record files to read.
+   * @param tool - Tool key.
+   * @returns Recorded paths by bundle id.
+   * @throws {RegistryError} Any `RECORD.*` error from loading a file.
+   */
+  public async entriesForTool(locations: readonly RecordLocation[], tool: string): Promise<Map<string, string[]>> {
+    const entries = new Map<string, string[]>();
+    for (const location of locations) {
+      const { record } = await this.store.load(location);
+      for (const [bundleId, bundle] of Object.entries(record.bundles)) {
+        if (Object.hasOwn(bundle.tools, tool)) {
+          const paths = bundle.tools[tool].files.map((file) => file.path);
+          entries.set(bundleId, [...new Set([...(entries.get(bundleId) ?? []), ...paths])]);
+        }
+      }
+    }
+    return new Map([...entries].toSorted(([left], [right]) => compareCodeUnits(left, right)));
+  }
+
+  /**
    * Delete the superseded files of a saved change (W1 step 13, BR3.4, NFR4.2).
    *
    * Each path goes through the delete-time confinement check; only a regular
