@@ -20,6 +20,7 @@ import {
   type InstallRecordServices,
   type Lockfile,
   type LockfileSourceEntry,
+  orderConfiguredSources,
   readLockfile,
   type RecordInstallInput,
   type RecordInstallResult,
@@ -31,7 +32,6 @@ import {
   selectRecord,
 } from '@ai-primitives-hub/app';
 import {
-  DEFAULT_LOCAL_HUB_ID,
   describeRecordError,
   type InstallationScope,
   isRecordError,
@@ -456,29 +456,20 @@ export const prepareRecordSelection = async (
 };
 
 /**
- * Configured sources by id for the source trust gate (NFR4.11): the active
- * hub's sources first, then detached (`default-local`) sources whose id the
- * active hub does not use. A hub that cannot be read contributes no source,
- * so its entries fall back to the record's copy without credentials.
+ * Configured sources by id for the source trust gate (NFR4.11), in app's
+ * `orderConfiguredSources` order: the active hub's sources first, then
+ * detached (`default-local`) sources whose id the active hub does not use. A
+ * hub that cannot be read contributes no source, so its entries fall back to
+ * the record's copy without credentials.
  * @param ctx - CLI context.
  * @returns Configured sources keyed by id, in lookup order.
  */
 export const configuredSources = async (ctx: Context): Promise<Map<string, RegistrySource>> => {
   const manager = createHubManager({ ctx });
-  const sources = new Map<string, RegistrySource>();
-  let active: RegistrySource[] = [];
-  try {
-    active = await manager.listSources();
-  } catch {
-    // No readable active hub: no configured source from it.
-  }
-  const detached = (await manager.listSourcesAcrossAllHubs()).filter((source) => source.hubId === DEFAULT_LOCAL_HUB_ID);
-  for (const source of [...active, ...detached]) {
-    if (!sources.has(source.id)) {
-      sources.set(source.id, source);
-    }
-  }
-  return sources;
+  // No readable active hub pointer: no source counts as the active hub's.
+  const activeHubId = await manager.getActiveHubId().catch(() => null);
+  const ordered = orderConfiguredSources(await manager.listSourcesAcrossAllHubs(), activeHubId);
+  return new Map(ordered.map((source) => [source.id, source]));
 };
 
 /** Token provider that never returns a token. */
