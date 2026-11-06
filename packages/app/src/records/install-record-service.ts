@@ -13,7 +13,9 @@
  * the caller passes the change to `deleteSuperseded` after the save (BR3.4).
  * `listEntries` gives the `status` rows (BR9.2), `findEntries` and
  * `listToolEntries` the located entries, and `holdingLocation` the file
- * an entry is re-recorded in (BR6.5). `moveEntry` moves an entry unchanged
+ * an entry is re-recorded in (BR6.5). `uninstallEntry` removes an entry and
+ * deletes its files, keeping shared and locally modified ones (NFR4.13).
+ * `moveEntry` moves an entry unchanged
  * between the two repository files (BR11.5) and `remapSource` rewrites a
  * source id in both (BR11.9).
  *
@@ -54,6 +56,9 @@ import {
 import {
   removeExcluded,
 } from './git-root';
+import {
+  findModifiedFiles,
+} from './modified-files';
 import type {
   LoadedRecord,
   RecordStore,
@@ -172,6 +177,32 @@ export interface LocatedToolEntry {
   /** Tool key. */
   tool: string;
   entry: ToolEntry;
+}
+
+/** Input of {@link InstallRecordService.uninstallEntry}. */
+export interface UninstallEntryInput {
+  /** A record file holding the entry; for a repository file both files at its root are read. */
+  location: RecordLocation;
+  /** Bundle id. */
+  bundleId: string;
+  /** Tool key of the entry. */
+  tool: string;
+  /** More root-relative paths to keep, e.g. files found modified before an update wrote over them. */
+  keep?: ReadonlySet<string>;
+}
+
+/** Outcome of {@link InstallRecordService.uninstallEntry}. */
+export interface UninstallEntryResult {
+  /** The saved change from `recordUninstall`. */
+  change: RecordInstallResult;
+  /** Root-relative files that were removed. */
+  deleted: string[];
+  /** Root-relative files kept: listed by another entry, then modified, missing or in `keep` (NFR4.9, NFR4.13). */
+  kept: string[];
+  /** The kept files that are still on disk with content that no longer matches the recorded checksum, sorted. */
+  modified: string[];
+  /** Non-fatal problems from the saves and the deletions, for the caller to log. */
+  warnings: string[];
 }
 
 /** Outcome of {@link InstallRecordService.deleteSuperseded}. */
@@ -743,6 +774,52 @@ export class InstallRecordService {
       location: changed[0].file.location,
       warnings,
       siblings: []
+    };
+  }
+
+  /**
+   * Uninstall one tool's entry and delete its files (FR4.1, NFR4.9, NFR4.13):
+   * the entry's files that no longer match their recorded checksum, or are
+   * missing, are found first; then {@link recordUninstall} removes the entry
+   * and saves; then {@link deleteSuperseded} removes its files except those
+   * another entry still lists, the modified or missing ones and `keep`. Works
+   * for a repository file (both files at its root) and for a user record.
+   * The `info/exclude` update for a local-only file stays with the caller.
+   * @param input - The file holding the entry, the bundle id, the tool and extra paths to keep.
+   * @returns The change, the removed and kept files, the modified files kept, and the warnings.
+   * @throws {RegistryError} `RECORD.ENTRY_NOT_FOUND` when no file has the
+   * entry (nothing is changed); any `RECORD.*` error from loading or saving.
+   */
+  public async uninstallEntry(input: UninstallEntryInput): Promise<UninstallEntryResult> {
+    const { location, bundleId, tool } = input;
+    const other = this.otherLocation(location);
+    const recorded: RecordedFile[] = [];
+    for (const file of other === undefined ? [location] : [location, other]) {
+      const { record } = await this.store.load(file);
+      const bundle = Object.hasOwn(record.bundles, bundleId) ? record.bundles[bundleId] : undefined;
+      recorded.push(...(bundle !== undefined && Object.hasOwn(bundle.tools, tool) ? bundle.tools[tool].files : []));
+    }
+    const changedOrMissing = new Set(await findModifiedFiles(this.fs, location.root, recorded));
+    const change = await this.recordUninstall({ location, bundleId, tool });
+    const isKept = (recordedPath: string): boolean => changedOrMissing.has(recordedPath) || input.keep?.has(recordedPath) === true;
+    const removal = await this.deleteSuperseded({
+      location: change.location,
+      deletedFiles: change.deletedFiles.filter((recordedPath) => !isKept(recordedPath))
+    });
+    const keptOwn = change.deletedFiles.filter((recordedPath) => isKept(recordedPath));
+    const modified: string[] = [];
+    for (const recordedPath of keptOwn.filter((candidate) => changedOrMissing.has(candidate))) {
+      const stat = await this.fs.lstat(path.join(change.location.root, ...recordedPath.split('/'))).catch(() => undefined);
+      if (stat !== undefined) {
+        modified.push(recordedPath);
+      }
+    }
+    return {
+      change,
+      deleted: removal.deleted,
+      kept: [...change.keptSharedFiles, ...keptOwn],
+      modified,
+      warnings: [...change.warnings, ...removal.warnings]
     };
   }
 

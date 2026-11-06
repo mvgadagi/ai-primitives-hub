@@ -10,8 +10,9 @@
  * install record (`ai-primitives-hub.lock.json` and
  * `ai-primitives-hub.local.lock.json`, format 3.0.0) that repository-scope
  * installs write: a bundle recorded there for the target's type is removed
- * through `InstallRecordService.recordUninstall` (only that tool's entry; a
- * file another entry still lists is kept). Bundles that are not in the
+ * through `InstallRecordService.uninstallEntry` (only that tool's entry; a
+ * file another entry still lists, or edited since the install, is kept).
+ * Bundles that are not in the
  * record fall back to the old store below, so installs made before the
  * record still uninstall.
  *
@@ -648,7 +649,8 @@ async function performRecordBundleUninstall(
 /**
  * `uninstall --lockfile <file>` on a 3.0.0 record file (BR7.2): remove each
  * bundle's entry for the target's type from that record, deleting its files
- * except those another entry still lists (keep-if-listed). Entries for other
+ * except those another entry still lists (keep-if-listed) and those edited
+ * since the install (NFR4.13). Entries for other
  * tools are kept. The target must write at the record's level and on its
  * git root, the same check record update and replay use (NFR4.10).
  * @param run Options, target, context and output format.

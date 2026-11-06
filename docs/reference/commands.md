@@ -67,7 +67,7 @@ At repository scope, `install` records the bundle in a new install record at the
 - Both record files are read before anything is written. A record that cannot be read stops the install with a `RECORD.*` error (exit 1) that names the file, and writes nothing. Run `ai-primitives-hub explain <code>` for the fix.
 - An existing `prompt-registry.lock.json` is left untouched. User-scope installs are unchanged.
 
-At repository scope, `uninstall` removes the target's tool entry from the install record and deletes its files, keeping any file another entry still lists. The record file is deleted when no bundles remain. Bundles installed before this change, which only `prompt-registry.lock.json` lists, are still uninstalled from that file.
+At repository scope, `uninstall` removes the target's tool entry from the install record and deletes its files, keeping any file another entry still lists and any file you edited after the install (a warning names each one). The record file is deleted when no bundles remain. Bundles installed before this change, which only `prompt-registry.lock.json` lists, are still uninstalled from that file.
 
 Every command that reads or changes the record ends its text output with `Record: <level> <path>`, and its `-o json` data carries `level` and `records` (the record files read).
 
