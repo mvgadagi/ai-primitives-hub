@@ -80,6 +80,7 @@ import {
   InstallOptions,
   Profile,
   RegistrySource,
+  RepositoryCommitMode,
   SearchQuery,
   SourceSyncedEvent,
   SourceType,
@@ -1788,6 +1789,24 @@ export class RegistryManager {
       workspaceRoot,
       () => this.recordAdapter.listOldBundles(workspaceRoot)
     );
+  }
+
+  /**
+   * Commit mode of the host tool's own repository entry of a bundle. The
+   * merged listing shows the newest entry across tools, so another tool's
+   * entry in the other record file can hide the mode this host would switch.
+   * @param bundleId - Bundle id.
+   * @returns The mode of the record file holding the host entry; `undefined`
+   * without a workspace or a host entry (old-file rows use the listing's mode).
+   * @throws {RegistryError} Any `RECORD.*` error from loading.
+   */
+  public async getHostCommitMode(bundleId: string): Promise<RepositoryCommitMode | undefined> {
+    const workspaceRoot = getWorkspaceRoot();
+    if (!workspaceRoot) {
+      return undefined;
+    }
+    const located = await this.recordAdapter.findHostEntry(workspaceRoot, bundleId);
+    return located === undefined ? undefined : (located.location.commitMode ?? 'commit');
   }
 
   /**
