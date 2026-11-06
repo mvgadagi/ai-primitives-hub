@@ -1,0 +1,76 @@
+name: Primitives Review CI
+
+# Runs github-actions/primitives-review end to end with gemma4:e2b and the static scanner built
+# from this checkout, on the test fixtures, and checks the grades and the pass/fail status.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'github-actions/primitives-review/**'
+      - 'github-actions/gemma4/scripts/**'
+      - '.github/workflows/primitives-review-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Review fixtures (gemma4:e2b)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: "pnpm"
+          cache-dependency-path: "pnpm-lock.yaml"
+
+      - name: Build the scanner CLI
+        run: |
+          pnpm install --frozen-lockfile --prefer-offline
+          pnpm --filter "@ai-primitives-hub/cli..." run build
+
+      # scope: all reviews the fixtures whether or not this PR changed them; no comment here.
+      - name: Review fixtures
+        id: review
+        continue-on-error: true
+        uses: ./github-actions/primitives-review
+        with:
+          paths: github-actions/primitives-review/test/fixtures/*
+          scope: all
+          fail-below: C
+          comment: 'false'
+          scanner-command: node packages/cli/bin/ai-primitives-hub.js
+
+      - name: Check grades and status
+        env:
+          REPORT: ${{ steps.review.outputs.report-json }}
+          STATUS: ${{ steps.review.outputs.status }}
+          OUTCOME: ${{ steps.review.outcome }}
+        run: |
+          set -euo pipefail
+          grade() { jq -r --arg p "$1" '.primitives[] | select(.path | endswith($p)) | .grade' "$REPORT"; }
+          score() { jq -r --arg p "$1" '.primitives[] | select(.path | endswith($p)) | .score // -1' "$REPORT"; }
+          skill=skills/deploy-helper/SKILL.md
+          prompt=prompts/unit-tests.prompt.md
+          echo "skill $(grade $skill) ($(score $skill)); prompt $(grade $prompt) ($(score $prompt)); status $STATUS"
+          jq -e '.reviewed == 2' "$REPORT" >/dev/null || { echo "::error::Expected 2 reviewed fixtures"; exit 1; }
+          [[ "$(grade $skill)" =~ ^[DE]$ ]] || { echo "::error::Unsafe skill should grade D or E"; exit 1; }
+          jq -e --arg p "$skill" '.primitives[] | select(.path | endswith($p)) | .criteria[] | select(.id == "R7") | .score == 1' "$REPORT" >/dev/null \
+            || { echo "::error::R7 should be capped at 1 by the CRITICAL injection finding"; exit 1; }
+          (( $(score $prompt) > $(score $skill) )) || { echo "::error::The prompt should outscore the unsafe skill"; exit 1; }
+          [[ "$STATUS" == failure && "$OUTCOME" == failure ]] || { echo "::error::The unsafe skill should fail the review (fail-below C)"; exit 1; }
