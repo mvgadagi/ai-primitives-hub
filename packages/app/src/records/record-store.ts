@@ -281,6 +281,27 @@ export class RecordStore {
   }
 
   /**
+   * Both repository record files for a start folder, loaded and checked, so a
+   * bad record stops an install before anything is written (BR3.5, NFR5.2),
+   * with the file the commit mode records in (BR2.2).
+   * @param input - Where the git-root walk starts and the install's commit mode.
+   * @param input.start - The target's root path, or the current folder.
+   * @param input.commitMode - `local-only` picks the local-only file; anything else the committed one.
+   * @returns Both locations (committed first) and the chosen one.
+   * @throws {RegistryError} Any `RECORD.*` error from loading either file.
+   */
+  public async loadRepository(input: { start: string; commitMode?: RecordLocation['commitMode'] }): Promise<{
+    locations: [RecordLocation, RecordLocation];
+    location: RecordLocation;
+  }> {
+    const locations = await this.resolveRepository(input);
+    for (const location of locations) {
+      await this.load(location);
+    }
+    return { locations, location: input.commitMode === 'local-only' ? locations[1] : locations[0] };
+  }
+
+  /**
    * Load and check a record file (workflow W3). A missing file gives an empty record.
    * @param location - Where the record lives.
    * @returns The loaded record.

@@ -1767,7 +1767,7 @@ export class RegistryManager {
    * state for listing problems across refreshes (BR5.5).
    */
   public getInstallRecordListing(): InstallRecordListing {
-    this.installRecordListing ??= new InstallRecordListing();
+    this.installRecordListing ??= new InstallRecordListing({ fs: this.recordAdapter.fs, store: this.recordAdapter.store });
     return this.installRecordListing;
   }
 

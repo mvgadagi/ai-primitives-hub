@@ -184,12 +184,14 @@ interface RepositoryRecords extends InstallRecordServices {
 
 /**
  * Build the record services and locate the repository record files for a
- * repository-scope target (BR2.1, BR2.2). Loads nothing.
+ * repository-scope target (BR2.1, BR2.2). Without `given`, both files at the
+ * target's git root are loaded and checked first (`RecordStore.loadRepository`).
  * @param ctx - CLI context; `ctx.cwd()` is the fallback start folder.
  * @param target - Effective repository-scope target.
  * @param fs - Filesystem port.
- * @param given - Record files already selected (`--lockfile`); both files at the target's git root otherwise.
+ * @param given - Record files already selected and checked (`--lockfile`); both files at the target's git root otherwise.
  * @returns The services, the workspace root, the record locations and the exclusion.
+ * @throws {RegistryError} Any `RECORD.*` error from loading.
  */
 const openRepositoryRecords = async (
   ctx: Context,
@@ -199,16 +201,9 @@ const openRepositoryRecords = async (
 ): Promise<RepositoryRecords> => {
   const services = createRecordServices(fs);
   const workspaceRoot = target.rootPath ?? ctx.cwd();
-  let locations: readonly RecordLocation[];
-  let location: RecordLocation;
-  if (given === undefined || given.length === 0) {
-    const [committed, localOnly] = await services.store.resolveRepository({ start: workspaceRoot });
-    locations = [committed, localOnly];
-    location = target.commitMode === 'local-only' ? localOnly : committed;
-  } else {
-    locations = given;
-    location = given[0];
-  }
+  const { locations, location } = given === undefined || given.length === 0
+    ? await services.store.loadRepository({ start: workspaceRoot, commitMode: target.commitMode })
+    : { locations: given, location: given[0] };
   return {
     ...services,
     workspaceRoot,
@@ -234,9 +229,6 @@ export const prepareRepositoryRecord = async (
 ): Promise<PreparedRepositoryRecord> => {
   try {
     const records = await openRepositoryRecords(ctx, target, fs);
-    for (const location of records.locations) {
-      await records.store.load(location);
-    }
     return {
       location: records.location,
       service: records.service,
