@@ -24,7 +24,6 @@
  */
 import * as path from 'node:path';
 import {
-  type BundleRecord,
   compareCodeUnits,
   FORBIDDEN_KEYS,
   type InstallRecord,
@@ -60,6 +59,10 @@ import {
 import {
   findModifiedFiles,
 } from './modified-files';
+import {
+  hashRecordedFile,
+  putToolEntry,
+} from './record-entry';
 import type {
   LoadedRecord,
   RecordStore,
@@ -311,12 +314,6 @@ const MERGED_MCP_CONFIG_PATHS = mergedMcpConfigPaths();
 export const isMergedMcpConfigPath = (relative: string, workspacePrefix = ''): boolean =>
   MERGED_MCP_CONFIG_PATHS.some((mcpPath) => relative === (workspacePrefix === '' ? mcpPath : `${workspacePrefix}/${mcpPath}`));
 
-const createBundle = (): BundleRecord => {
-  const bundle = Object.create(null) as BundleRecord;
-  bundle.tools = Object.create(null) as BundleRecord['tools'];
-  return bundle;
-};
-
 /**
  * Prototype-free copy of a recorded file's path and checksum.
  * @param file - Recorded file to copy.
@@ -326,6 +323,17 @@ const copyRecordedFile = (file: RecordedFile): RecordedFile => {
   copy.path = file.path;
   copy.checksum = file.checksum;
   return copy;
+};
+
+/**
+ * Whether a bundle's entries at a level are a lone `unknown` one (BR21.3,
+ * BR21.4): a bundle migrated from an old store that no tool has reinstalled.
+ * @param tools - Tool keys of the bundle's entries at the level.
+ * @returns `true` when `unknown` is the only tool.
+ */
+export const isLoneUnknown = (tools: Iterable<string>): boolean => {
+  const names = new Set(tools);
+  return names.size === 1 && names.has(UNKNOWN_TOOL_NAME);
 };
 
 /**
@@ -490,12 +498,9 @@ export class InstallRecordService {
       if (files.has(relative) || isMergedMcpConfigPath(relative, workspacePrefix)) {
         continue;
       }
-      const file = Object.create(null) as RecordedFile;
-      file.path = relative;
-      file.checksum = await this.fs.hashFile(path.join(root, ...relative.split('/')));
-      files.set(relative, file);
+      files.set(relative, await hashRecordedFile(this.fs, root, relative));
     }
-    return [...files.values()].toSorted((a, b) => compareCodeUnits(a.path, b.path));
+    return [...files.values()];
   }
 
   /**
@@ -535,13 +540,29 @@ export class InstallRecordService {
   }
 
   /**
-   * Save a changed repository file, or remove it when it has no bundles left
-   * (BR3.6; uninstall of the last entry). Removing the local-only file also
-   * removes its line from `info/exclude` (BR2.3).
+   * Remove a bundle's `unknown` entry and the source only it used (BR21.2).
+   * @param record - Record to change.
+   * @param bundleId - Bundle id.
+   * @returns Whether there was an entry to remove.
+   */
+  private clearUnknown(record: InstallRecord, bundleId: string): boolean {
+    const removed = this.removeEntry(record, bundleId, UNKNOWN_TOOL_NAME);
+    if (removed !== undefined) {
+      this.dropUnusedSource(record, removed.sourceId);
+    }
+    return removed !== undefined;
+  }
+
+  /**
+   * Save a changed record file, or remove it when it is a repository file with
+   * no bundles left (BR3.6; uninstall of the last entry). Removing the
+   * local-only file also removes its line from `info/exclude` (BR2.3). An
+   * empty user record is saved, so its `importedUserLockfileAt` marker
+   * outlives the bundles (BR20.1).
    * @param other - The file, as loaded and changed.
    */
   private async saveOther(other: LoadedRecord): Promise<string[]> {
-    if (Object.keys(other.record.bundles).length > 0) {
+    if (other.location.level !== 'repository' || Object.keys(other.record.bundles).length > 0) {
       return (await this.store.save(other.location, other.record)).warnings;
     }
     const name = path.basename(other.location.path);
@@ -550,7 +571,7 @@ export class InstallRecordService {
     } catch (error) {
       return [`Could not remove the empty record ${name}: ${error instanceof Error ? error.message : String(error)}`];
     }
-    if (other.location.level === 'repository' && other.location.commitMode === 'local-only') {
+    if (other.location.commitMode === 'local-only') {
       const excluded = await removeExcluded(this.fs, other.location.root, name);
       return excluded.warning === undefined ? [] : [excluded.warning];
     }
@@ -650,7 +671,9 @@ export class InstallRecordService {
    * Loads both repository files, replaces only `bundles.<bundleId>.tools.<tool>`
    * in the target file, records the source, moves the entry out of the other
    * file, brings sibling entries that share its files to the same version and
-   * shared file list (BR8.3, see `syncSiblings`), and saves the target file
+   * shared file list (BR8.3, see `syncSiblings`), removes the bundle's
+   * `unknown` entry from both files without listing its files for deletion
+   * (BR21.2), and saves the target file
    * first, then the other one if it changed. Deletes nothing; the delete
    * candidates are checked against every entry of both files after the sync
    * (keep-if-listed, NFR4.9).
@@ -669,7 +692,7 @@ export class InstallRecordService {
     const target = await this.store.load(location);
     const otherLocation = otherRepositoryLocation(location);
     const other = otherLocation === undefined ? undefined : await this.store.load(otherLocation);
-    const files = await this.toRecordedFiles(location.root, input.writtenPaths, input.workspaceRoot);
+    const written = await this.toRecordedFiles(location.root, input.writtenPaths, input.workspaceRoot);
 
     const previous = [this.removeEntry(target.record, bundleId, tool)];
     const moved = other === undefined ? undefined : this.removeEntry(other.record, bundleId, tool);
@@ -679,16 +702,13 @@ export class InstallRecordService {
       this.dropUnusedSource(other.record, moved.sourceId);
     }
 
-    const entry = Object.create(null) as ToolEntry;
-    entry.version = input.version;
-    entry.sourceId = input.source.sourceId;
-    entry.sourceType = input.sourceType;
-    entry.installedAt = this.now().toISOString();
-    entry.files = files;
-    if (!Object.hasOwn(target.record.bundles, bundleId)) {
-      target.record.bundles[bundleId] = createBundle();
-    }
-    target.record.bundles[bundleId].tools[tool] = entry;
+    const { files } = putToolEntry(target.record, bundleId, tool, {
+      version: input.version,
+      sourceId: input.source.sourceId,
+      sourceType: input.sourceType,
+      installedAt: this.now().toISOString(),
+      files: written
+    });
     target.record.sources[input.source.sourceId] = source;
 
     const loaded = other === undefined ? [target] : [target, other];
@@ -715,8 +735,12 @@ export class InstallRecordService {
       (stillListed.has(oldPath) ? keptSharedFiles : deletedFiles).push(oldPath);
     }
 
+    // A reinstall clears the bundle's `unknown` entry; its files are only no longer listed (BR21.2).
+    const clearedOther = other !== undefined && this.clearUnknown(other.record, bundleId);
+    this.clearUnknown(target.record, bundleId);
+
     const warnings = [...(await this.store.save(location, target.record)).warnings];
-    if (other !== undefined && (moved !== undefined || sync.changed.has(other))) {
+    if (other !== undefined && (moved !== undefined || clearedOther || sync.changed.has(other))) {
       warnings.push(...(await this.saveOther(other)));
     }
     const synced = sync.siblings.filter((sibling) => sibling.synced);
@@ -841,6 +865,47 @@ export class InstallRecordService {
   }
 
   /**
+   * Bundles whose only entry across the given record files is `unknown`
+   * ({@link isLoneUnknown}), with that entry (from the committed file when
+   * both repository files hold it).
+   * @param locations - Record files of one level, committed first.
+   * @returns The entries by bundle id, in file order.
+   * @throws {RegistryError} Any `RECORD.*` error from loading a file.
+   */
+  public async findLoneUnknown(locations: readonly RecordLocation[]): Promise<Map<string, LocatedToolEntry>> {
+    const byBundle = new Map<string, LocatedToolEntry[]>();
+    for (const located of await this.listToolEntries(locations)) {
+      byBundle.set(located.bundleId, [...(byBundle.get(located.bundleId) ?? []), located]);
+    }
+    return new Map([...byBundle]
+      .filter(([, entries]) => isLoneUnknown(entries.map((located) => located.tool)))
+      .map(([bundleId, [located]]) => [bundleId, located]));
+  }
+
+  /**
+   * Remove a bundle's `unknown` entry and keep every file it lists: no tool
+   * is known to own them (BR21.3, BR21.4). Built on {@link uninstallEntry}
+   * with each file the entry lists, in either repository file, kept.
+   * @param location - A record file of the level; for a repository file both files at its root are read.
+   * @param bundleId - Bundle id.
+   * @returns As {@link uninstallEntry}; nothing is deleted and `kept` lists every file of the entry, sorted.
+   * @throws {RegistryError} `RECORD.ENTRY_NOT_FOUND` when no file has the
+   * entry (nothing is changed); any `RECORD.*` error from loading or saving.
+   */
+  public async removeUnknownEntry(location: RecordLocation, bundleId: string): Promise<UninstallEntryResult> {
+    const other = otherRepositoryLocation(location);
+    const keep = new Set<string>();
+    // Each file on its own: an interrupted move can leave two copies with different files.
+    for (const file of other === undefined ? [location] : [location, other]) {
+      for (const { entry } of await this.findEntries([file], bundleId, UNKNOWN_TOOL_NAME)) {
+        entry.files.forEach((recorded) => keep.add(recorded.path));
+      }
+    }
+    const result = await this.uninstallEntry({ location, bundleId, tool: UNKNOWN_TOOL_NAME, keep });
+    return { ...result, kept: result.kept.toSorted(compareCodeUnits) };
+  }
+
+  /**
    * Move one tool's entry between the committed and the local-only repository
    * file, unchanged (BR11.5, NFR7.3): its version, `sourceId`, `sourceType`,
    * `installedAt` and files with their checksums are copied as they are, with
@@ -878,10 +943,7 @@ export class InstallRecordService {
     // The store's load checked that the source exists.
     const source = from.record.sources[entry.sourceId];
     this.dropUnusedSource(from.record, entry.sourceId);
-    if (!Object.hasOwn(to.record.bundles, bundleId)) {
-      to.record.bundles[bundleId] = createBundle();
-    }
-    to.record.bundles[bundleId].tools[tool] = entry;
+    putToolEntry(to.record, bundleId, tool, entry);
     to.record.sources[entry.sourceId] = source;
 
     const saved = await this.store.save(targetLocation, to.record);

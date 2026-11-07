@@ -85,16 +85,27 @@ export const listUserRecordBundles = async (reader: UserRecordReader): Promise<{
 
 /**
  * The shared user record's item for a bundle, when the record holds the host
- * tool's entry for it (BR16.x); `undefined` in WSL or when the record cannot
- * be read. RegistryManager and {@link getInstalledBundleForScope} both use it.
+ * tool's entry for it (BR16.x), or, with `withLoneUnknown`, when its only
+ * entry is a migrated `unknown` one (BR21.4); `undefined` in WSL or when the
+ * record cannot be read. RegistryManager and {@link getInstalledBundleForScope}
+ * both use it.
  * @param reader - Adapter, storage and listing to read with.
  * @param bundleId - Bundle id.
+ * @param options - Lookup options.
+ * @param options.withLoneUnknown - Also give a bundle whose only user record entry is `unknown`.
+ * @throws {RegistryError} Any `RECORD.*` error from the `unknown` entry lookup.
  */
-// Layer 5 adds an `options: { withLoneUnknown?: boolean } = {}` parameter here
-// (an item whose only entry is a migrated `unknown` one, BR21.4) rather than a copy.
-export const findUserRecordBundle = async (reader: UserRecordReader, bundleId: string): Promise<InstalledBundle | undefined> => {
+export const findUserRecordBundle = async (
+  reader: UserRecordReader,
+  bundleId: string,
+  options: { withLoneUnknown?: boolean } = {}
+): Promise<InstalledBundle | undefined> => {
   const { items, hostBundleIds } = await listUserRecordBundles(reader);
-  return hostBundleIds.has(bundleId) ? items.find((bundle) => bundle.bundleId === bundleId) : undefined;
+  const item = items.find((bundle) => bundle.bundleId === bundleId);
+  if (item === undefined || hostBundleIds.has(bundleId)) {
+    return item;
+  }
+  return options.withLoneUnknown === true && (await reader.adapter.findLoneUnknownEntry(bundleId)) !== undefined ? item : undefined;
 };
 
 /**
@@ -141,7 +152,10 @@ export async function getInstalledBundleForScope(
   }
 
   // User and workspace scopes use RegistryStorage; at user scope, the shared
-  // user record's host-tool item when RegistryStorage has none (BR16.x).
+  // user record's host-tool item when RegistryStorage has none (BR16.x), or
+  // its item for a migrated bundle whose only entry is `unknown` (BR21.4), as
+  // RegistryManager finds it for an uninstall: the scope commands refuse a
+  // move of that item with the reinstall hint before they look it up.
   const stored = await storage.getInstalledBundle(bundleId, scope);
   if (stored !== undefined || scope !== 'user') {
     return stored;
@@ -149,7 +163,7 @@ export async function getInstalledBundleForScope(
   try {
     const adapter = userRecord?.adapter
       ?? new ExtensionRecordAdapter({ sources: { listSources: () => storage.getSources() }, userRecordPath: storage.getPaths().userRecord });
-    return await findUserRecordBundle({ adapter, storage, listing: userRecord?.listing }, bundleId);
+    return await findUserRecordBundle({ adapter, storage, listing: userRecord?.listing }, bundleId, { withLoneUnknown: true });
   } catch (error) {
     logger.warn(`[bundleScopeUtils] Failed to read the user record for bundle ${bundleId}:`, error instanceof Error ? error : undefined);
     return undefined;
