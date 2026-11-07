@@ -42,6 +42,9 @@ import type {
   TargetWriteResult,
 } from '@ai-primitives-hub/core';
 import {
+  relativeInside,
+} from '@ai-primitives-hub/core';
+import {
   ZipBundleExtractor,
 } from '@ai-primitives-hub/infra';
 import * as yaml from 'js-yaml';
@@ -447,9 +450,9 @@ export class BundleInstaller {
    * @throws {RegistryError} Any `RECORD.*` error from loading, after it was shown once.
    */
   private async userRecordListsUnder(location: RecordLocation, folder: string): Promise<boolean> {
-    const prefix = `${path.relative(location.root, folder).split(path.sep).join('/')}/`;
     const listed = await this.records.listedPathsIn(location).catch((error: unknown) => this.rethrowRecordError(error, [], location.root));
-    return [...listed].some((file) => file.startsWith(prefix));
+    const relative = relativeInside(location.root, folder);
+    return relative !== undefined && [...listed].some((file) => file.startsWith(`${relative}/`));
   }
 
   /**
