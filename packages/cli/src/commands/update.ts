@@ -62,7 +62,6 @@ import {
   ArtifactoryHttpClient,
   createGitHubSourceAuthRuntime,
   defaultTokenProvider,
-  FileSystemLayoutConfigLoader,
   GitHubApiClient,
   HttpsBundleDownloader,
   isGitHubAppAuthEnabled,
@@ -71,13 +70,13 @@ import {
   type RepositoryCommitMode,
   RepositoryScopeWriter,
   RepositoryScopeWriterAdapter,
-  resolveUserConfigDir,
   SourceDispatcher,
   StaticTokenProvider,
   TargetStateStore,
   ZipBundleExtractor,
 } from '@ai-primitives-hub/infra';
 import {
+  createLayoutLoader,
   CLI_RECORD_GENERATED_BY,
   Command,
   configuredSources,
@@ -599,11 +598,7 @@ function writerFor(ctx: Context, target: Target, scope: string, commitMode: Repo
     return new RepositoryScopeWriterAdapter(writer);
   }
   const transformer = TransformerRegistry.withBuiltIns().getTransformer(target.type);
-  const layoutLoader = new FileSystemLayoutConfigLoader({
-    cwd: ctx.cwd(),
-    fs: ctx.fs,
-    userConfigDir: resolveUserConfigDir(ctx.env)
-  });
+  const layoutLoader = createLayoutLoader(ctx);
   return new FileTreeTargetWriter({ fs: ctx.fs, env: writerEnv(ctx.env, effectiveScope), transformer, layoutLoader });
 }
 
