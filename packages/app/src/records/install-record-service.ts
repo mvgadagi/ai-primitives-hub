@@ -54,15 +54,15 @@ import {
   resolveDeleteTarget,
 } from './confine-path';
 import {
-  hashRecordedFile,
-  putToolEntry,
-} from './record-entry';
-import {
   removeExcluded,
 } from './git-root';
 import {
   findModifiedFiles,
 } from './modified-files';
+import {
+  hashRecordedFile,
+  putToolEntry,
+} from './record-entry';
 import type {
   LoadedRecord,
   RecordStore,
