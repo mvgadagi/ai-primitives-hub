@@ -54,8 +54,6 @@ import {
   writeLockfile,
 } from '@ai-primitives-hub/app';
 import {
-  LOCAL_RECORD_FILE_NAME,
-  RECORD_FILE_NAME,
   type RecordLocation,
   type Target,
   UNKNOWN_TOOL_NAME,
@@ -733,26 +731,15 @@ interface UninstallRun {
 }
 
 /**
- * The record file a real uninstall would remove the bundle's entry from,
- * searched in the order `recordUninstall` uses: the prepared file, then (at
- * repository level) the other repository file. Read-only, for the dry run.
+ * The record file a real uninstall would remove the bundle's entry from: the
+ * file of the level holding the entry for the prepared tool (app's
+ * `holdingLocation`), else the prepared file. Read-only, for the dry run.
  * @param prepared The level's record files, loaded and checked.
  * @param bundleId Bundle to uninstall.
  * @returns The file holding the entry for the prepared tool, else the prepared file.
  */
 async function holdingRecordLocation(prepared: PreparedRepositoryUninstall, bundleId: string): Promise<RecordLocation> {
-  const { location } = prepared;
-  const candidates = [location];
-  if (location.level === 'repository') {
-    const isLocal = location.commitMode === 'local-only';
-    candidates.push({
-      level: 'repository',
-      root: location.root,
-      path: path.join(location.root, isLocal ? RECORD_FILE_NAME : LOCAL_RECORD_FILE_NAME),
-      commitMode: isLocal ? 'commit' : 'local-only'
-    });
-  }
-  return await prepared.service.holdingLocation(candidates, bundleId, prepared.tool) ?? location;
+  return await prepared.service.holdingLocation(prepared.locations, bundleId, prepared.tool) ?? prepared.location;
 }
 
 /**
