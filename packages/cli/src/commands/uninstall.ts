@@ -46,6 +46,7 @@ import {
   type MigrationReport,
   readLockfile,
   removeBundleEntry,
+  type StatusRow,
   type TargetWriter,
   TransformerRegistry,
   UninstallPipeline,
@@ -84,6 +85,7 @@ import {
   prepareUninstallForTarget,
   prepareUnknownUninstall,
   readTargetsSafely,
+  type RecordDecision,
   recordedTools,
   recordOutputFields,
   type RecordOutputFields,
@@ -157,16 +159,12 @@ const multiToolError = (bundleId: string, tools: readonly string[]): RegistryErr
 
 /**
  * Refuse `uninstall <id>` without `--target` when the bundle has entries for
- * more than one tool in the selected record (BR7.1). The selection is
- * read-only: nothing is migrated.
- * @param ctx CLI context.
+ * more than one tool in the decision's record (BR7.1).
+ * @param rows Rows of the record decision.
  * @param bundleId Bundle to uninstall.
- * @param scope `--scope`, when given.
  * @throws {RegistryError} `USAGE.MISSING_FLAG` listing the tools; nothing was removed.
- * @throws {RegistryError} A `RECORD.*` error naming the file.
  */
-async function refuseMultiToolUninstall(ctx: Context, bundleId: string, scope?: UninstallOptions['scope']): Promise<void> {
-  const { rows } = await prepareRecordDecision(ctx, { command: 'uninstall', scope });
+function assertSingleTool(rows: readonly StatusRow[], bundleId: string): void {
   const tools = recordedTools(rows, bundleId);
   if (tools.length > 1) {
     throw multiToolError(bundleId, tools);
@@ -174,10 +172,19 @@ async function refuseMultiToolUninstall(ctx: Context, bundleId: string, scope?: 
 }
 
 /**
+ * Whether `uninstall` removes one bundle: `<bundle-id>` given, without `--all`
+ * or `--lockfile`.
+ * @param opts Uninstall options.
+ * @returns `true` in bundle mode.
+ */
+const isBundleMode = (opts: UninstallOptions): boolean => opts.bundle !== undefined && opts.bundle.length > 0 && opts.all !== true
+  && (opts.lockfile === undefined || opts.lockfile.length === 0);
+
+/**
  * `uninstall <bundle-id>` with no inferred target: zero or several targets
- * configured and no `--target` (BR23.3). The record is selected read-only
- * (`--scope`, then the default rule) and decides, in this order:
- * - several tools: refused (BR7.1);
+ * configured and no `--target` (BR23.3). The record, already selected
+ * read-only (`--scope`, then the default rule) and refused for several tools
+ * (BR7.1), decides:
  * - a lone `unknown` entry: removed with its files kept, through a
  *   target-free prepare that migrates the level first (BR21.3);
  * - one tool: uninstalled through the configured target mapped to it
@@ -187,31 +194,36 @@ async function refuseMultiToolUninstall(ctx: Context, bundleId: string, scope?: 
  * @param opts Uninstall options; `opts.bundle` is set.
  * @param ctx CLI context.
  * @param fmt Output format.
+ * @param decision The read-only record decision, already checked for several tools.
  * @returns Exit code, or `undefined` when the record holds no entry for the bundle (the caller then needs a target, BR23.2).
  * @throws {RegistryError} `USAGE.MISSING_FLAG`, or a `RECORD.*` error naming the file.
  */
-async function uninstallWithoutTarget(opts: UninstallOptions, ctx: Context, fmt: OutputFormat): Promise<number | undefined> {
+async function uninstallWithoutTarget(
+  opts: UninstallOptions,
+  ctx: Context,
+  fmt: OutputFormat,
+  decision: RecordDecision
+): Promise<number | undefined> {
   const bundleId = opts.bundle as string;
-  let decision = await prepareRecordDecision(ctx, { command: 'uninstall', scope: opts.scope });
+  let current = decision;
   // A migration can change the bundle's entries once; the second pass decides on the migrated record.
   for (let pass = 0; pass < 2; pass++) {
-    const tools = recordedTools(decision.rows, bundleId);
+    const tools = recordedTools(current.rows, bundleId);
     if (tools.length === 0) {
       return undefined;
     }
-    if (tools.length > 1) {
-      throw multiToolError(bundleId, tools);
-    }
     const [tool] = tools;
     if (tool === UNKNOWN_TOOL_NAME) {
-      const prepared = await prepareUnknownUninstall(ctx, decision, bundleId, { dryRun: opts.dryRun });
+      const prepared = await prepareUnknownUninstall(ctx, current, bundleId, { dryRun: opts.dryRun });
       if ('changed' in prepared) {
-        decision = prepared.changed;
+        // The migrated record is refused for several tools too (BR7.1).
+        assertSingleTool(prepared.changed.rows, bundleId);
+        current = prepared.changed;
         continue;
       }
       return performUnknownBundleUninstall({ opts, ctx, fmt }, prepared.uninstall, bundleId);
     }
-    const { selection, fs } = decision.prepared;
+    const { selection, fs } = current.prepared;
     const targets = await readTargetsSafely(loadTargets(ctx));
     const mapping = await mapToolToTarget({ fs, tool, level: selection.level, gitRoot: selection.root, targets, cwd: ctx.cwd() });
     if ('skip' in mapping) {
@@ -297,12 +309,16 @@ export class UninstallCommand extends BaseUninstallCommand {
     };
 
     const typedTarget = opts.target !== undefined && opts.target.length > 0;
+    const bundleMode = isBundleMode(opts);
+    // Without --target, the record is selected read-only once: it is checked
+    // here and decides below when no target is inferred (BR23.3).
+    let decision: RecordDecision | undefined;
     try {
       // BR7.1: checked before the target is inferred, so a single configured
       // target never silently picks one of several recorded tools.
-      if (!typedTarget && opts.bundle !== undefined && opts.bundle.length > 0 && opts.all !== true
-        && (opts.lockfile === undefined || opts.lockfile.length === 0)) {
-        await refuseMultiToolUninstall(ctx, opts.bundle, opts.scope);
+      if (!typedTarget && bundleMode) {
+        decision = await prepareRecordDecision(ctx, { command: 'uninstall', scope: opts.scope });
+        assertSingleTool(decision.rows, opts.bundle as string);
       }
     } catch (err) {
       if (err instanceof RegistryError) {
@@ -327,11 +343,9 @@ export class UninstallCommand extends BaseUninstallCommand {
     }
 
     try {
-      const bundleMode = opts.bundle !== undefined && opts.bundle.length > 0 && opts.all !== true
-        && (opts.lockfile === undefined || opts.lockfile.length === 0);
       const targetName = await inferTargetName(ctx, opts.target);
-      if (bundleMode && targetName === undefined) {
-        const code = await uninstallWithoutTarget(opts, ctx, fmt);
+      if (decision !== undefined && targetName === undefined) {
+        const code = await uninstallWithoutTarget(opts, ctx, fmt, decision);
         if (code !== undefined) {
           return code;
         }
