@@ -1702,10 +1702,9 @@ export class RegistryManager {
    * @param silent
    */
   public async uninstallBundle(bundleId: string, scope: InstallationScope = 'user', silent = false): Promise<void> {
-    // Older records of the level are migrated first (BR18.1), so the uninstall works on the 3.0.0 record.
-    await this.migrateBeforeWrite(scope);
-    // Entries only another tool holds are refused before anything touches disk (BR11.2).
-    await this.assertHostTool(bundleId, scope, 'uninstall');
+    // Older records of the level are migrated first (BR18.1), so the uninstall works on the 3.0.0 record;
+    // entries only another tool holds are refused before anything touches disk (BR11.2).
+    await this.prepareWrite(bundleId, scope, 'uninstall');
     const installed = await uninstallInstalledBundle(
       bundleId,
       scope,
@@ -1809,8 +1808,7 @@ export class RegistryManager {
     const target = (await this.listInstalledBundles()).find((bundle) => bundle.bundleId === bundleId);
     if (target) {
       // Older records of the item's level are migrated before the guard reads the record (BR18.1).
-      await this.migrateBeforeWrite(target.scope);
-      await this.assertHostTool(bundleId, target.scope, 'update');
+      await this.prepareWrite(bundleId, target.scope, 'update');
     }
     // A repository entry updates from the source `buildSource` decides: the
     // active hub's, then detached, then any stored source with that id (NFR4.15).
@@ -1956,6 +1954,23 @@ export class RegistryManager {
     if (workspaceRoot) {
       await this.recordAdapter.migrateBeforeWrite('repository', workspaceRoot);
     }
+  }
+
+  /**
+   * The one entry check of a write action on one bundle item: migrate the
+   * older records of its level ({@link migrateBeforeWrite}, BR18.1), then
+   * refuse it when only another tool's entries hold the bundle, or when a
+   * lone migrated `unknown` entry cannot be moved ({@link assertHostTool},
+   * BR11.2, BR21.4). Uninstall, update, the two moves and the commit-mode
+   * switch all start with it.
+   * @param bundleId - Bundle the action targets.
+   * @param scope - Scope of the exact item the action works on.
+   * @param action - The action, for the message.
+   * @throws {RegistryError} Any `RECORD.*` error from the migration (shown once) or from loading; `RECORD.CLI_MANAGED` for a refused action.
+   */
+  public async prepareWrite(bundleId: string, scope: InstallationScope, action: CliManagedAction): Promise<void> {
+    await this.migrateBeforeWrite(scope);
+    await this.assertHostTool(bundleId, scope, action);
   }
 
   /**

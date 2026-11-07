@@ -87,8 +87,7 @@ export class BundleScopeCommands {
 
       // The user level's older records are migrated first (BR18.1); a migrated
       // `unknown` entry cannot be moved and asks for a reinstall (BR21.4)
-      await this.registryManager.migrateBeforeWrite('user');
-      await this.registryManager.assertHostTool(bundleId, 'user', 'move-to-repository');
+      await this.registryManager.prepareWrite(bundleId, 'user', 'move-to-repository');
 
       // Check if bundle is installed at user scope (RegistryStorage or the shared user record)
       const userBundle = await this.getBundleForScope(bundleId, 'user');
@@ -171,8 +170,7 @@ export class BundleScopeCommands {
 
       // CLI-installed items are refused before any lookup or dialog (BR5.6),
       // after the repository level's older records were migrated (BR18.1)
-      await this.registryManager.migrateBeforeWrite('repository');
-      await this.registryManager.assertHostTool(bundleId, 'repository', 'move-to-user');
+      await this.registryManager.prepareWrite(bundleId, 'repository', 'move-to-user');
 
       // Get bundle from repository scope (uses lockfile)
       const repoBundle = await this.getBundleForScope(bundleId, 'repository');
@@ -251,8 +249,7 @@ export class BundleScopeCommands {
 
       // CLI-installed items are refused before any lookup, dialog or exclude change (BR5.6),
       // after the repository level's older records were migrated (BR18.1)
-      await this.registryManager.migrateBeforeWrite('repository');
-      await this.registryManager.assertHostTool(bundleId, 'repository', 'switch-commit-mode');
+      await this.registryManager.prepareWrite(bundleId, 'repository', 'switch-commit-mode');
 
       // Get bundle from repository scope (uses lockfile)
       const repoBundle = await this.getBundleForScope(bundleId, 'repository');
