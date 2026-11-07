@@ -142,6 +142,30 @@ interface PreparedUserInstall {
   profileEntryIds: string[];
 }
 
+/** What {@link BundleInstaller.recordHostInstall} records, at either level. */
+interface HostInstallToRecord {
+  /** Record file the host entry is recorded in. */
+  location: RecordLocation;
+  /** Configured source the entry records (NFR4.15). */
+  source: RecordSourceInput;
+  /** Root the written paths are recorded against: the workspace folder, or home. */
+  workspaceRoot: string;
+  /** Absolute paths the writer wrote. */
+  written: readonly string[];
+  /** Writer-group siblings brought along (BR11.6); repository level only. */
+  syncSiblings?: (tool: string) => boolean;
+  /**
+   * The host entry an update replaces, removed when the new version has
+   * another bundle id. `deleteFilesNow`: its files go with the entry (app's
+   * `uninstallEntry`, repository level); otherwise with the superseded files
+   * after both saves (user level). Each level keeps its order of record
+   * writes and deletions.
+   */
+  previous?: { bundleId: string; location: RecordLocation; deleteFilesNow: boolean };
+  /** Root-relative paths that were modified or missing before the write; never deleted (NFR4.13). */
+  modified: ReadonlySet<string>;
+}
+
 /**
  * Bundle Installer
  */
@@ -250,43 +274,93 @@ export class BundleInstaller {
   ): Promise<void> {
     const group = writerGroupFor(this.records.hostTool, routeKeys);
     const root = prepared.location.root;
-    let change: RecordInstallResult;
+    const warnings = await this.recordHostInstall(bundle, {
+      location: prepared.location,
+      source: prepared.source,
+      workspaceRoot: prepared.workspaceRoot,
+      written,
+      syncSiblings: (tool) => group.includes(tool),
+      previous: inPlace?.location === undefined
+        ? undefined
+        : { bundleId: inPlace.previousBundleId, location: inPlace.location, deleteFilesNow: true },
+      modified: inPlace?.modified ?? new Set<string>()
+    }, async (change) => {
+      this.reportOutOfDateSiblings(bundle.id, change.siblings);
+      await this.retireOldEntry(prepared.workspaceRoot, bundle.id, root);
+    });
+    this.logWarnings(warnings);
+    this.logger.debug(`Recorded ${bundle.id} for ${this.records.hostTool} in ${prepared.location.path}`);
+  }
+
+  /**
+   * Record the host tool's entry with the written files at either level
+   * (W9 steps 6–10, W11, BR16.x): the new entry, then, when an update brings
+   * another bundle id, the removal of the old id's host entry; then
+   * `beforeDelete`; then the superseded files are deleted except modified
+   * ones (NFR4.13).
+   * @param bundle - Installed bundle.
+   * @param input - Where and what to record.
+   * @param beforeDelete - Runs after the saves, before the superseded files are deleted.
+   * @returns The warnings of the saves and the deletions, in that order.
+   * @throws {RegistryError} A `RECORD.*` error, after it was shown once.
+   */
+  private async recordHostInstall(
+    bundle: Bundle,
+    input: HostInstallToRecord,
+    beforeDelete?: (change: RecordInstallResult) => Promise<void>
+  ): Promise<string[]> {
+    const root = input.location.root;
+    const tool = this.records.hostTool;
+    const changes: RecordInstallResult[] = [];
     const warnings: string[] = [];
     try {
-      change = await this.records.service.recordInstall({
-        location: prepared.location,
+      const change = await this.records.service.recordInstall({
+        location: input.location,
         bundleId: bundle.id,
         version: bundle.version,
-        tool: this.records.hostTool,
-        source: prepared.source,
-        sourceType: prepared.source.type,
-        writtenPaths: written,
-        workspaceRoot: prepared.workspaceRoot,
-        syncSiblings: (tool) => group.includes(tool)
+        tool,
+        source: input.source,
+        sourceType: input.source.type,
+        writtenPaths: input.written,
+        workspaceRoot: input.workspaceRoot,
+        syncSiblings: input.syncSiblings
       });
+      changes.push(change);
       warnings.push(...change.warnings);
-      if (inPlace !== undefined && inPlace.previousBundleId !== bundle.id && inPlace.location !== undefined) {
+      const previous = input.previous;
+      if (previous !== undefined && previous.bundleId !== bundle.id) {
         // The new version has another bundle id: the old id's host entry goes,
         // with its files except shared and modified ones (NFR4.13).
-        const removed = await this.records.service.uninstallEntry({
-          location: inPlace.location, bundleId: inPlace.previousBundleId, tool: this.records.hostTool, keep: inPlace.modified
-        });
-        warnings.push(...removed.warnings);
+        if (previous.deleteFilesNow) {
+          const removed = await this.records.service.uninstallEntry({
+            location: previous.location, bundleId: previous.bundleId, tool, keep: input.modified
+          });
+          warnings.push(...removed.warnings);
+        } else {
+          const removed = await this.records.service.recordUninstall({ location: previous.location, bundleId: previous.bundleId, tool });
+          changes.push(removed);
+          warnings.push(...removed.warnings);
+        }
       }
     } catch (error) {
-      this.rethrowRecordError(error, written, root);
+      this.rethrowRecordError(error, input.written, root);
     }
-    this.reportOutOfDateSiblings(bundle.id, change.siblings);
-    await this.retireOldEntry(prepared.workspaceRoot, bundle.id, root);
-    const modified = inPlace?.modified ?? new Set<string>();
-    const removal = await this.records.service.deleteSupersededAfterAll([{
+    await beforeDelete?.(changes[0]);
+    const removal = await this.records.service.deleteSupersededAfterAll(changes.map((change) => ({
       location: change.location,
-      deletedFiles: change.deletedFiles.filter((file) => !modified.has(file))
-    }]).catch((error: unknown) => this.rethrowRecordError(error, [], root));
-    for (const warning of [...warnings, ...removal.warnings]) {
+      deletedFiles: change.deletedFiles.filter((file) => !input.modified.has(file))
+    }))).catch((error: unknown) => this.rethrowRecordError(error, [], root));
+    return [...warnings, ...removal.warnings];
+  }
+
+  /**
+   * Log record warnings.
+   * @param warnings - Non-fatal problems from the record service.
+   */
+  private logWarnings(warnings: readonly string[]): void {
+    for (const warning of warnings) {
       this.logger.warn(`[BundleInstaller] ${warning}`);
     }
-    this.logger.debug(`Recorded ${bundle.id} for ${this.records.hostTool} in ${prepared.location.path}`);
   }
 
   /**
@@ -298,7 +372,7 @@ export class BundleInstaller {
   private async retireOldEntry(workspaceRoot: string, bundleId: string, root: string): Promise<void> {
     try {
       const retired = await this.records.retireOldEntry(workspaceRoot, bundleId);
-      retired?.warnings.forEach((warning) => this.logger.warn(`[BundleInstaller] ${warning}`));
+      this.logWarnings(retired?.warnings ?? []);
     } catch (error) {
       this.rethrowRecordError(error, [], root);
     }
@@ -326,7 +400,7 @@ export class BundleInstaller {
         location,
         source,
         previousBundleId: located === undefined ? undefined : (previousBundleId ?? bundle.id),
-        modified: new Set(located === undefined ? [] : await findModifiedFiles(this.records.fs, location.root, located.entry.files)),
+        modified: await this.modifiedFilesOf(located),
         profileEntryIds
       };
     } catch (error) {
@@ -346,35 +420,17 @@ export class BundleInstaller {
    */
   private async recordUserInstall(bundle: Bundle, prepared: PreparedUserInstall, written: readonly string[]): Promise<void> {
     const root = prepared.location.root;
-    const { changes, removal } = await this.records.serialize(prepared.location.path, async () => {
-      const recorded: RecordInstallResult[] = [];
-      try {
-        recorded.push(await this.records.service.recordInstall({
-          location: prepared.location,
-          bundleId: bundle.id,
-          version: bundle.version,
-          tool: this.records.hostTool,
-          source: prepared.source,
-          sourceType: prepared.source.type,
-          writtenPaths: written,
-          workspaceRoot: this.records.home
-        }));
-        if (prepared.previousBundleId !== undefined && prepared.previousBundleId !== bundle.id) {
-          // The new version has another bundle id: the old id's host entry goes.
-          recorded.push(await this.records.service.recordUninstall({ location: prepared.location, bundleId: prepared.previousBundleId, tool: this.records.hostTool }));
-        }
-      } catch (error) {
-        this.rethrowRecordError(error, written, root);
-      }
-      const deleted = await this.records.service.deleteSupersededAfterAll(recorded.map((change) => ({
-        location: change.location,
-        deletedFiles: change.deletedFiles.filter((file) => !prepared.modified.has(file))
-      }))).catch((error: unknown) => this.rethrowRecordError(error, [], root));
-      return { changes: recorded, removal: deleted };
-    });
-    for (const warning of [...changes.flatMap((change) => change.warnings), ...removal.warnings]) {
-      this.logger.warn(`[BundleInstaller] ${warning}`);
-    }
+    const warnings = await this.records.serialize(prepared.location.path, () => this.recordHostInstall(bundle, {
+      location: prepared.location,
+      source: prepared.source,
+      workspaceRoot: this.records.home,
+      written,
+      previous: prepared.previousBundleId === undefined
+        ? undefined
+        : { bundleId: prepared.previousBundleId, location: prepared.location, deleteFilesNow: false },
+      modified: prepared.modified
+    }));
+    this.logWarnings(warnings);
     if (prepared.previousBundleId !== undefined && prepared.previousBundleId !== bundle.id) {
       await this.removeBundleCache(prepared.previousBundleId);
     }
@@ -422,6 +478,15 @@ export class BundleInstaller {
       await this.removeDirectory(bundleCachePath);
       this.logger.debug(`Removed bundle cache directory: ${bundleCachePath}`);
     }
+  }
+
+  /**
+   * The files of a host entry that were modified or missing before a write
+   * (NFR4.13); none without an entry.
+   * @param located - The host entry, if any.
+   */
+  private async modifiedFilesOf(located: LocatedToolEntry | undefined): Promise<Set<string>> {
+    return new Set(located === undefined ? [] : await findModifiedFiles(this.records.fs, located.location.root, located.entry.files));
   }
 
   /**
@@ -479,6 +544,7 @@ export class BundleInstaller {
     }
     await this.removeBundleCache(bundleId);
   }
+
 
   /**
    * One information message for sibling entries sharing the bundle's files
@@ -832,23 +898,42 @@ export class BundleInstaller {
     let inPlace: RepositoryUpdateInPlace;
     try {
       const located = await this.records.findHostEntry(workspaceRoot, installed.bundleId);
-      inPlace = {
-        previousBundleId: installed.bundleId,
-        location: located?.location,
-        modified: new Set(located === undefined ? [] : await findModifiedFiles(this.records.fs, located.location.root, located.entry.files))
-      };
+      inPlace = { previousBundleId: installed.bundleId, location: located?.location, modified: await this.modifiedFilesOf(located) };
     } catch (error) {
       this.rethrowRecordError(error);
     }
-    // MCP config entries are merged, not recorded: refresh them as before.
-    await this.uninstallMcpServers(installed.bundleId, 'repository');
-    const updated = await this.installFromBuffer(
+    return this.updateInPlace(
+      installed,
       bundle,
       bundleBuffer,
-      { scope: 'repository', version: bundle.version, commitMode: inPlace.location?.commitMode ?? installed.commitMode },
       sourceType,
+      { scope: 'repository', version: bundle.version, commitMode: inPlace.location?.commitMode ?? installed.commitMode },
       inPlace
     );
+  }
+
+  /**
+   * Update over the installed host entry, with no uninstall first (W11, and
+   * BR16.x at user scope): refresh the MCP servers, then install the new
+   * version in place.
+   * @param installed - Installed version.
+   * @param bundle - New version.
+   * @param bundleBuffer - Downloaded bundle bytes.
+   * @param sourceType - Source type of the new version.
+   * @param options - Scope and version of the install.
+   * @param inPlace - The old entry, read before the write.
+   */
+  private async updateInPlace(
+    installed: InstalledBundle,
+    bundle: Bundle,
+    bundleBuffer: Buffer,
+    sourceType: string | undefined,
+    options: InstallOptions,
+    inPlace: RepositoryUpdateInPlace
+  ): Promise<InstalledBundle> {
+    // MCP config entries are merged, not recorded: refresh them as before.
+    await this.uninstallMcpServers(installed.bundleId, options.scope);
+    const updated = await this.installFromBuffer(bundle, bundleBuffer, options, sourceType, inPlace);
     this.logger.info('Bundle updated successfully');
     return updated;
   }
@@ -1242,17 +1327,16 @@ export class BundleInstaller {
         return await this.updateRepositoryInPlace(installed, bundle, bundleBuffer, resolvedSourceType);
       }
       if (await this.findUserRecordEntry(installed, 'update') !== undefined) {
-        // In place over the user record's host entry, like a repository update (BR16.x).
-        await this.uninstallMcpServers(installed.bundleId, 'user');
-        const updated = await this.installFromBuffer(
+        // In place over the user record's host entry, like a repository update (BR16.x);
+        // the install itself reads the entry and its modified files.
+        return await this.updateInPlace(
+          installed,
           bundle,
           bundleBuffer,
-          { scope: 'user', version: bundle.version, profileId: installed.profileId },
           resolvedSourceType,
+          { scope: 'user', version: bundle.version, profileId: installed.profileId },
           { previousBundleId: installed.bundleId, modified: new Set() }
         );
-        this.logger.info('Bundle updated successfully');
-        return updated;
       }
 
       // Uninstall old version
