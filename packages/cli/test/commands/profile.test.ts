@@ -19,6 +19,9 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises';
+import {
+  createHash,
+} from 'node:crypto';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
@@ -29,6 +32,8 @@ import type {
   HttpRequest,
   HttpResponse,
   ProfileActivationState,
+  RegistrySource,
+  Target,
 } from '@ai-primitives-hub/core';
 import {
   buildZip,
@@ -49,6 +54,7 @@ import {
 } from '../../src/commands/hub';
 import {
   InstallCommand,
+  installBundleWithSource,
 } from '../../src/commands/install';
 import {
   ProfileActivateCommand,
@@ -70,6 +76,11 @@ import {
   createLegacyReleaseArchive,
   writeReleaseArchive,
 } from '../fixtures/release-archives';
+import {
+  readInstallRecord,
+  userRecordPath,
+  workspaceEnv,
+} from '../helpers/install-record-fixtures';
 
 const COMMAND_CLASSES = [
   TargetAddCommand,
@@ -650,5 +661,112 @@ profiles:
 
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain('manifest id \\"sample-skills\\" does not match expected');
+  });
+});
+
+describe('profile activate with an Artifactory hub source', () => {
+  const ART_ROOT = 'https://artifactory.example/repo/source';
+  /** Artifactory source configured without `authMode`, as in the hub config below. */
+  const ART_SOURCE: RegistrySource = {
+    id: 'art-src', name: 'Art Source', type: 'artifactory', url: ART_ROOT, enabled: true, priority: 0
+  };
+  let workspace: string;
+  let targetDir: string;
+
+  const env = (): Record<string, string> => workspaceEnv(workspace);
+  // Fake anonymous Artifactory: an index and the archive of `art-bundle` 1.0.0.
+  const bundleZip = buildZip([...createLegacyReleaseArchive({ id: 'art-bundle', version: '1.0.0' })]
+    .map(([filePath, bytes]) => ({ path: filePath, bytes })));
+  const requests: HttpRequest[] = [];
+  const http: HttpClient = {
+    fetch: async (request: HttpRequest): Promise<HttpResponse> => {
+      requests.push(request);
+      if (request.url === `${ART_ROOT}/index-v1.json`) {
+        return {
+          statusCode: 200,
+          body: new TextEncoder().encode(JSON.stringify({
+            formatVersion: 1, source: { id: ART_SOURCE.id, name: ART_SOURCE.name, updatedAt: '2026-01-01T00:00:00Z' },
+            bundles: [{
+              id: 'art-bundle', version: '1.0.0', name: 'Art Bundle', description: '', author: 'Test', environments: ['vscode'],
+              tags: [], dependencies: [], license: 'Apache-2.0', lastUpdated: '2026-01-01T00:00:00Z',
+              manifest: { path: '1.0.0/art-bundle/deployment-manifest.yml', size: 1, sha256: 'a'.repeat(64) },
+              archive: { path: '1.0.0/art-bundle.zip', size: bundleZip.length,
+                sha256: createHash('sha256').update(bundleZip).digest('hex'), mediaType: 'application/zip' }
+            }]
+          })),
+          finalUrl: request.url,
+          headers: {}
+        };
+      }
+      if (request.url === `${ART_ROOT}/1.0.0/art-bundle.zip`) {
+        return { statusCode: 200, body: bundleZip, finalUrl: request.url, headers: {} };
+      }
+      throw new Error(`Unexpected request: ${request.url}`);
+    }
+  };
+  const tokens = { getToken: async () => undefined };
+
+  const run = async (argv: string[]): Promise<{ exitCode: number; stdout: string }> => {
+    const ctx = createTestContext({ cwd: workspace, fs: new NodeFileSystem(), env: env() });
+    const exitCode = await runCli(argv, { ctx, http, tokens, commandClasses: COMMAND_CLASSES, commands: [], name: 'test', version: 'test' });
+    return { exitCode, stdout: ctx.stdout.captured() };
+  };
+  const recordedSource = async (): Promise<unknown> =>
+    (await readInstallRecord(userRecordPath(env()))).sources[ART_SOURCE.id];
+
+  beforeEach(async () => {
+    requests.length = 0;
+    workspace = await mkdtemp(path.join(os.tmpdir(), 'cli-profile-artifactory-test-'));
+    targetDir = path.join(workspace, 'target');
+    await mkdir(targetDir, { recursive: true });
+    const hubConfigFile = path.join(workspace, 'hub-config.yml');
+    await writeFile(hubConfigFile, `version: 1.0.0
+metadata:
+  name: Art Hub
+  description: Hub with an Artifactory source
+  maintainer: test
+  updatedAt: '2026-01-01T00:00:00Z'
+sources:
+  - id: ${ART_SOURCE.id}
+    name: ${ART_SOURCE.name}
+    type: artifactory
+    url: ${ART_ROOT}
+    enabled: true
+    priority: 0
+    hubId: art-hub
+profiles:
+  - id: art
+    name: Art Developer
+    description: One Artifactory bundle
+    bundles:
+      - id: art-bundle
+        version: 1.0.0
+        source: ${ART_SOURCE.id}
+        required: true
+`);
+    expect((await run(['target', 'add', 'copilot', '--type', 'copilot-cli', '--path', targetDir, '-o', 'json'])).exitCode).toBe(0);
+    expect((await run(['hub', 'add', '--type', 'local', '--location', hubConfigFile, '--id', 'art-hub', '-o', 'json'])).exitCode).toBe(0);
+    expect((await run(['hub', 'use', 'art-hub', '-o', 'json'])).exitCode).toBe(0);
+  });
+
+  afterEach(async () => {
+    await rm(workspace, { recursive: true, force: true });
+  });
+
+  it('records the same source as install for an Artifactory source configured without authMode (BR3.2, NFR4.11)', async () => {
+    const activated = await run(['profile', 'activate', 'art', '--target', 'copilot', '-o', 'json']);
+    expect(activated.exitCode, activated.stdout).toBe(0);
+    const fromProfile = await recordedSource();
+    expect((await run(['profile', 'deactivate', '-o', 'json'])).exitCode).toBe(0);
+    await rm(userRecordPath(env()), { force: true });
+
+    const ctx = createTestContext({ cwd: workspace, fs: new NodeFileSystem(), env: env() });
+    const target: Target = { name: 'copilot', type: 'copilot-cli', scope: 'user', path: targetDir };
+    const installed = await installBundleWithSource('art-bundle', ART_SOURCE, target, ctx, http, tokens, 'json');
+    expect(installed, ctx.stdout.captured()).toBe(0);
+
+    expect(fromProfile).toEqual({ type: 'artifactory', url: ART_ROOT, authMode: 'anonymous' });
+    expect(await recordedSource()).toEqual(fromProfile);
+    expect(requests.filter((request) => request.headers?.Authorization !== undefined)).toEqual([]);
   });
 });
