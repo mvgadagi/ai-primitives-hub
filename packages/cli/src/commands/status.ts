@@ -1,21 +1,26 @@
 /**
  * `ai-primitives-hub status` — show current configuration state at a glance.
  *
- * Reads targets, active hub, primitive index, and lockfile to produce
+ * Reads targets, active hub, primitive index, and the install record to produce
  * a concise dashboard without any network calls. Useful for verifying
  * that a project is correctly configured before activating profiles.
  *
- * Lockfile section reads `app`'s dict-based `Lockfile` (`bundles: Record<bundleId,
- * LockfileBundleEntry>`, extension-compatible schema) rather than the reference
- * branch's array-of-entries schema — `LockfileBundleEntry` has no `target` field
- * since repository-scope entries always write to `.github/` regardless of which
- * IDE target nominally triggered the install (see `app/stores/json-lockfile-store.ts`).
+ * The record is selected with no level given (W4, BR6.2): the repository
+ * record when one (or an old `prompt-registry.*` file) is at the git root,
+ * else the user lockfile. JSON carries `level`, `records` and one
+ * `entries` row per (bundle, tool) (BR9.2); bundles only in an old file are
+ * listed under tool `unknown` with that file as their record (BR10.1).
  * @module commands/status
  */
 import {
-  readLockfile,
   resolveUserConfigPaths,
+  type StatusRow,
 } from '@ai-primitives-hub/app';
+import {
+  compareCodeUnits,
+  type RecordLevel,
+  UNKNOWN_TOOL_NAME,
+} from '@ai-primitives-hub/core';
 import {
   ActiveHubStore,
   defaultIndexFile,
@@ -27,22 +32,18 @@ import {
   type CommandDefinition,
   type Context,
   defineCommand,
-  findProjectLockfile,
   formatOutput,
   loadTargets,
+  oldFileOnlyBundles,
   Option,
   type OutputFormat,
+  prepareRecordSelection,
+  recordOutputFields,
   RegistryError,
   renderError,
+  renderRecordLine,
   resolveProjectConfigPath,
 } from '../framework';
-
-/** Bundle detail shown in verbose mode. */
-export interface StatusBundle {
-  bundleId: string;
-  bundleVersion: string;
-  installedAt: string;
-}
 
 /** Status data shape returned to callers. */
 export interface StatusData {
@@ -52,7 +53,16 @@ export interface StatusData {
   activeHubId: string | null;
   hubs: string[];
   index: { primitives: number; path: string } | null;
-  lockfile: { entries: number; path: string; bundles?: StatusBundle[] } | null;
+  /** Level of the selected record (BR6.2). */
+  level: RecordLevel;
+  /** Record files read: the selected new files, plus the old-store file when it exists. */
+  records: string[];
+  /**
+   * One row per (bundle, tool), sorted by bundle then tool (BR9.2). Bundles
+   * only in an old `prompt-registry.*` / user lockfile are listed under tool
+   * `unknown` with that file as their `record` (BR10.1).
+   */
+  entries: StatusRow[];
 }
 
 /**
@@ -118,7 +128,7 @@ export class StatusCommand extends Command {
  * Core status logic shared by both command variants.
  * @param ctx CLI context.
  * @param fmt Output format.
- * @param verbose Whether to include per-bundle details in the lockfile section.
+ * @param verbose Whether text output shows each entry's record file.
  * @returns Exit code.
  */
 async function runStatus(ctx: Context, fmt: OutputFormat, verbose: boolean): Promise<number> {
@@ -136,21 +146,7 @@ async function runStatus(ctx: Context, fmt: OutputFormat, verbose: boolean): Pro
     const indexPath = defaultIndexFile(ctx.env);
     const indexStats = tryLoadIndex(indexPath);
 
-    const lockPath = await findProjectLockfile(ctx);
-    const lockfile = lockPath === null ? null : await readLockfile(lockPath, ctx.fs);
-
-    let lockfileData: StatusData['lockfile'] = null;
-    if (lockfile !== null && lockPath !== null) {
-      const bundleIds = Object.keys(lockfile.bundles);
-      lockfileData = { entries: bundleIds.length, path: lockPath };
-      if (verbose) {
-        lockfileData.bundles = bundleIds.map((bundleId) => ({
-          bundleId,
-          bundleVersion: lockfile.bundles[bundleId].version,
-          installedAt: lockfile.bundles[bundleId].installedAt
-        }));
-      }
-    }
+    const record = await readRecordStatus(ctx);
 
     const data: StatusData = {
       configPath: configPath ?? null,
@@ -161,7 +157,7 @@ async function runStatus(ctx: Context, fmt: OutputFormat, verbose: boolean): Pro
       index: indexStats === null
         ? null
         : { primitives: indexStats.search({}).total, path: indexPath },
-      lockfile: lockfileData
+      ...record
     };
 
     formatOutput({
@@ -170,7 +166,7 @@ async function runStatus(ctx: Context, fmt: OutputFormat, verbose: boolean): Pro
       output: fmt,
       status: 'ok',
       data,
-      textRenderer: renderStatusText
+      textRenderer: (d) => renderStatusText(d, verbose)
     });
     return 0;
   } catch (err) {
@@ -185,6 +181,32 @@ async function runStatus(ctx: Context, fmt: OutputFormat, verbose: boolean): Pro
     }), ctx);
     return 1;
   }
+}
+
+/**
+ * Read a record level, files and rows for `status` (W8; BR6.2, BR9.2,
+ * BR10.1): select with no level given, list the new record's rows, then add
+ * bundles found only in the old-store file, under tool `unknown`, marked
+ * with that file's path.
+ * @param ctx CLI context.
+ * @returns The `level`, `records` and `entries` fields.
+ * @throws {RegistryError} A `RECORD.*` error naming the file.
+ */
+async function readRecordStatus(ctx: Context): Promise<Pick<StatusData, 'level' | 'records' | 'entries'>> {
+  const prepared = await prepareRecordSelection(ctx, { command: 'status' });
+  const { selection, service, fs } = prepared;
+  const entries = await service.listEntries(selection.locations);
+  const old = await oldFileOnlyBundles(ctx, prepared);
+  if (old !== undefined) {
+    for (const bundleId of old.bundleIds) {
+      entries.push({
+        bundleId, tool: UNKNOWN_TOOL_NAME, level: selection.level, version: old.lock.bundles[bundleId].version, record: old.lockPath, needsReinstall: false
+      });
+    }
+  }
+  entries.sort((left, right) => compareCodeUnits(left.bundleId, right.bundleId) || compareCodeUnits(left.tool, right.tool));
+  const { level, records } = await recordOutputFields(selection, fs, old?.lockPath);
+  return { level, records, entries };
 }
 
 /**
@@ -252,25 +274,26 @@ function renderIndexLine(index: StatusData['index']): string {
   return `index       ${index.primitives} primitives  [${index.path}]\n`;
 }
 
-function renderLockfileLines(lockfile: StatusData['lockfile']): string[] {
-  if (lockfile === null) {
+function renderEntryLines(d: StatusData, verbose: boolean): string[] {
+  if (d.entries.length === 0) {
     return ['lockfile    (none)\n'];
   }
-  const lines: string[] = [`lockfile    ${lockfile.entries} bundle${lockfile.entries === 1 ? '' : 's'} installed  [${lockfile.path}]\n`];
-  if (lockfile.bundles !== undefined && lockfile.bundles.length > 0) {
-    for (const b of lockfile.bundles) {
-      lines.push(`              ${b.bundleId}@${b.bundleVersion}  installed=${b.installedAt}\n`);
-    }
+  const bundles = new Set(d.entries.map((row) => row.bundleId)).size;
+  const lines = [`lockfile    ${bundles} bundle${bundles === 1 ? '' : 's'} installed (${d.entries.length} entr${d.entries.length === 1 ? 'y' : 'ies'})\n`];
+  for (const row of d.entries) {
+    const flag = row.needsReinstall ? '  needs reinstall' : '';
+    lines.push(`              ${row.bundleId}@${row.version} (${row.tool})${flag}${verbose ? `  [${row.record}]` : ''}\n`);
   }
   return lines;
 }
 
 /**
- * Render status as human-readable text.
+ * Render status as human-readable text: one line per (bundle, tool) and the `Record:` line.
  * @param d Status data.
+ * @param verbose Whether to show each row's record file.
  * @returns Rendered text.
  */
-function renderStatusText(d: StatusData): string {
+function renderStatusText(d: StatusData, verbose: boolean): string {
   return [
     'ai-primitives-hub status\n',
     '─'.repeat(40) + '\n',
@@ -278,6 +301,7 @@ function renderStatusText(d: StatusData): string {
     renderTargetsLine(d.targets),
     ...renderHubLines(d.activeHubId, d.hubs),
     renderIndexLine(d.index),
-    ...renderLockfileLines(d.lockfile)
+    ...renderEntryLines(d, verbose),
+    renderRecordLine({ level: d.level, records: d.records })
   ].join('');
 }

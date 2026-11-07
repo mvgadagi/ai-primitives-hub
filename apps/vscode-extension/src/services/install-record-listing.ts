@@ -21,6 +21,7 @@ import * as path from 'node:path';
 import {
   createInstallRecordServices,
   type RecordStore,
+  toLockfileBundleEntry,
 } from '@ai-primitives-hub/app';
 import {
   type BundleRecord,
@@ -36,9 +37,6 @@ import {
   NodeRecordFs,
 } from '@ai-primitives-hub/infra';
 import * as vscode from 'vscode';
-import type {
-  LockfileBundleEntry,
-} from '../types/lockfile';
 import type {
   InstalledBundle,
 } from '../types/registry';
@@ -186,14 +184,7 @@ export class InstallRecordListing {
   private async addItem(items: Map<string, InstalledBundle>, location: RecordLocation, bundleId: string, entry: ToolEntry): Promise<void> {
     // Same minimal manifest and `.github` install path LockfileManager uses:
     // never the git root, which the extension's uninstall would delete recursively.
-    const asLockfileEntry: LockfileBundleEntry = {
-      version: entry.version,
-      sourceId: entry.sourceId,
-      sourceType: entry.sourceType,
-      installedAt: entry.installedAt,
-      files: entry.files.map((file) => ({ path: file.path, checksum: file.checksum }))
-    };
-    const item = createInstalledBundleFromLockfile(bundleId, asLockfileEntry, {
+    const item = createInstalledBundleFromLockfile(bundleId, toLockfileBundleEntry(entry), {
       installPath: path.join(location.root, '.github'),
       filesMissing: await this.filesMissing(location.root, entry),
       commitModeOverride: location.commitMode ?? 'commit'
