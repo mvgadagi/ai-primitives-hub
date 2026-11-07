@@ -1,12 +1,14 @@
 /**
- * Refusal for bundles the ai-primitives-hub CLI installed (BR5.6, NFR4.3).
+ * Refusal for repository entries another tool owns (BR11.2, NFR4.12; C6
+ * `RECORD.CLI_MANAGED`).
  *
- * Until U3 moves update, uninstall, move and the commit-mode switch onto the
- * shared install-record service, the extension refuses these actions on
- * repository items that come from a 3.0.0 install record
- * (`recordOrigin === 'install-record'`). The refusal is a core
- * `RegistryError` with code `RECORD.CLI_MANAGED`, never a silent return, so no
- * caller can report it as a success. Callers turn it into one warning.
+ * The extension changes only its own tool's entries in the shared install
+ * record. An update, uninstall, move or commit-mode switch of a bundle whose
+ * record entries all belong to another tool (e.g. `kiro` while the extension
+ * runs in VS Code) is refused with a core `RegistryError` of code
+ * `RECORD.CLI_MANAGED`, never a silent return, so no caller can report it as
+ * a success. The message names the tool and the CLI command that changes it.
+ * Callers turn it into one warning.
  * @module utils/cli-managed
  */
 import {
@@ -16,53 +18,83 @@ import {
 } from '@ai-primitives-hub/core';
 import * as vscode from 'vscode';
 
-/** Extension actions guarded for CLI-installed repository items. */
+/** Extension actions guarded for repository entries of another tool. */
 export type CliManagedAction = 'update' | 'uninstall' | 'move-to-user' | 'switch-commit-mode';
 
-const ACTION_PHRASES: Readonly<Record<Exclude<CliManagedAction, 'update'>, string>> = {
-  uninstall: 'uninstall it',
-  'move-to-user': 'move it to user scope',
-  'switch-commit-mode': 'change its commit mode'
+/**
+ * The CLI command that does the refused action for another tool. Moving to
+ * user scope starts with an uninstall at repository level; a commit-mode
+ * switch is a reinstall with the other mode.
+ */
+const CLI_COMMANDS: Readonly<Record<CliManagedAction, string>> = {
+  update: 'update',
+  uninstall: 'uninstall',
+  'move-to-user': 'uninstall',
+  'switch-commit-mode': 'install'
 };
 
 /**
- * User-facing refusal message, per action (security-design.md, "Message wording").
+ * User-facing refusal message (C6 wording).
  * @param bundleId - Refused bundle.
  * @param action - Refused action.
- * @returns The message; the update wording names the CLI command that works in U1.
+ * @param tool - Tool the bundle's entry belongs to.
+ * @returns `<bundle> is installed for <tool>; change it with the CLI: ai-primitives-hub <action> <bundle> --target <a <tool> target>`.
  */
-export const cliManagedMessage = (bundleId: string, action: CliManagedAction): string => {
-  if (action === 'update') {
-    return `"${bundleId}" was installed with the ai-primitives-hub CLI. To update it, run "ai-primitives-hub install ${bundleId}" again.`;
-  }
-  return `"${bundleId}" was installed with the ai-primitives-hub CLI. The extension can't ${ACTION_PHRASES[action]} yet; this arrives in a later release.`;
-};
+export const cliManagedMessage = (bundleId: string, action: CliManagedAction, tool: string): string =>
+  `${bundleId} is installed for ${tool}; change it with the CLI: ai-primitives-hub ${CLI_COMMANDS[action]} ${bundleId} --target <a ${tool} target>`;
 
 /**
  * Build the `RECORD.CLI_MANAGED` refusal.
  * @param bundleId - Refused bundle.
  * @param action - Refused action.
+ * @param tool - Tool the bundle's entry belongs to.
  * @returns The error, ready to throw.
  */
-export const cliManagedError = (bundleId: string, action: CliManagedAction): RegistryError =>
+export const cliManagedError = (bundleId: string, action: CliManagedAction, tool: string): RegistryError =>
   recordError('RECORD.CLI_MANAGED', {
-    message: cliManagedMessage(bundleId, action),
-    context: { bundleId, action }
+    message: cliManagedMessage(bundleId, action, tool),
+    hint: '',
+    context: { bundleId, action, tool }
   });
 
 /**
- * Whether an error is the CLI-managed refusal.
+ * Whether an error is the other-tool refusal.
  * @param error - Anything thrown.
  */
 export const isCliManagedError = (error: unknown): error is RegistryError =>
   isRecordError(error, 'RECORD.CLI_MANAGED');
 
+/** Errors already shown to the user once (e.g. by `ExtensionRecordAdapter.showRecordError`). */
+const shownErrors = new WeakSet<object>();
+
 /**
- * Show the refusal as one warning notification, when `error` is one.
+ * Remember that an error was already shown, so callers do not show it again.
+ * @param error - The error shown.
+ */
+export const markErrorShown = (error: unknown): void => {
+  if (typeof error === 'object' && error !== null) {
+    shownErrors.add(error);
+  }
+};
+
+/**
+ * Whether an error was already shown to the user.
+ * @param error - Anything thrown.
+ */
+export const wasErrorShown = (error: unknown): boolean =>
+  typeof error === 'object' && error !== null && shownErrors.has(error);
+
+/**
+ * Show the refusal as one warning notification, when `error` is one. An
+ * error already shown elsewhere (a `RECORD.*` error with its "Open file"
+ * notification) is handled too, without a second notification.
  * @param error - Anything thrown by a guarded action.
- * @returns `true` when the warning was shown and the caller must stop without a success message.
+ * @returns `true` when the error was shown and the caller must stop without a success message.
  */
 export const showCliManagedWarning = (error: unknown): boolean => {
+  if (wasErrorShown(error)) {
+    return true;
+  }
   if (!isCliManagedError(error)) {
     return false;
   }
@@ -71,7 +103,7 @@ export const showCliManagedWarning = (error: unknown): boolean => {
 };
 
 /**
- * Show one warning listing the bundles a batch skipped because the CLI installed them.
+ * Show one warning listing the bundles a batch skipped because another tool's entry holds them.
  * @param bundleIds - Refused bundle ids; nothing is shown when empty.
  * @param action - The batch action.
  */
@@ -81,6 +113,6 @@ export const showCliManagedBatchWarning = (bundleIds: readonly string[], action:
   }
   const verb = action === 'update' ? 'updated' : 'uninstalled';
   void vscode.window.showWarningMessage(
-    `Skipped ${bundleIds.length} bundle(s) installed with the ai-primitives-hub CLI; they were not ${verb}: ${bundleIds.join(', ')}.`
+    `Skipped ${bundleIds.length} bundle(s) installed for another tool; they were not ${verb}: ${bundleIds.join(', ')}. Change them with the ai-primitives-hub CLI.`
   );
 };

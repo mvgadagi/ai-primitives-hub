@@ -11,10 +11,15 @@
  * (BR8.3), and saves the target file first, then the other one. It deletes
  * nothing: the superseded files come back in `RecordChange.deletedFiles`, and
  * the caller passes the change to `deleteSuperseded` after the save (BR3.4).
- * `listEntries` gives the `status` rows (BR9.2) and `holdingLocation` the file
- * an entry is re-recorded in (BR6.5).
+ * `listEntries` gives the `status` rows (BR9.2), `findEntries` and
+ * `listToolEntries` the located entries, and `holdingLocation` the file
+ * an entry is re-recorded in (BR6.5). `uninstallEntry` removes an entry and
+ * deletes its files, keeping shared and locally modified ones (NFR4.13).
+ * `moveEntry` moves an entry unchanged
+ * between the two repository files (BR11.5) and `remapSource` rewrites a
+ * source id in both (BR11.9).
  *
- * Rules: BR1.2, BR1.4–BR1.7, BR3.1, BR3.2, BR3.4, BR3.6, BR3.7, BR6.5, BR8.3, BR9.2; NFR4.2, NFR4.5, NFR4.9.
+ * Rules: BR1.2, BR1.4–BR1.7, BR3.1, BR3.2, BR3.4, BR3.6, BR3.7, BR6.5, BR8.3, BR9.2, BR11.5, BR11.9; NFR4.2, NFR4.5, NFR4.9, NFR4.15, NFR7.3.
  * @module records/install-record-service
  */
 import * as path from 'node:path';
@@ -23,6 +28,7 @@ import {
   compareCodeUnits,
   FORBIDDEN_KEYS,
   type InstallRecord,
+  otherRepositoryLocation,
   type RecordChange,
   type RecordedFile,
   recordError,
@@ -51,6 +57,9 @@ import {
 import {
   removeExcluded,
 } from './git-root';
+import {
+  findModifiedFiles,
+} from './modified-files';
 import type {
   LoadedRecord,
   RecordStore,
@@ -161,11 +170,102 @@ export interface StatusRow {
   needsReinstall: boolean;
 }
 
+/** One tool entry of a bundle, with the record file holding it. */
+export interface LocatedToolEntry {
+  /** The record file holding the entry. */
+  location: RecordLocation;
+  bundleId: string;
+  /** Tool key. */
+  tool: string;
+  entry: ToolEntry;
+}
+
+/** Input of {@link InstallRecordService.uninstallEntry}. */
+export interface UninstallEntryInput {
+  /** A record file holding the entry; for a repository file both files at its root are read. */
+  location: RecordLocation;
+  /** Bundle id. */
+  bundleId: string;
+  /** Tool key of the entry. */
+  tool: string;
+  /** More root-relative paths to keep, e.g. files found modified before an update wrote over them. */
+  keep?: ReadonlySet<string>;
+}
+
+/** Outcome of {@link InstallRecordService.uninstallEntry}. */
+export interface UninstallEntryResult {
+  /** The saved change from `recordUninstall`. */
+  change: RecordInstallResult;
+  /** Root-relative files that were removed. */
+  deleted: string[];
+  /** Root-relative files kept: listed by another entry, then modified, missing or in `keep` (NFR4.9, NFR4.13). */
+  kept: string[];
+  /** The kept files that are still on disk with content that no longer matches the recorded checksum, sorted. */
+  modified: string[];
+  /** Non-fatal problems from the saves and the deletions, for the caller to log. */
+  warnings: string[];
+}
+
 /** Outcome of {@link InstallRecordService.deleteSuperseded}. */
 export interface DeleteSupersededResult {
   /** Root-relative paths that were removed. */
   deleted: string[];
   /** One message per path that was skipped or could not be removed. */
+  warnings: string[];
+}
+
+/** Input of {@link InstallRecordService.moveEntry}. */
+export interface MoveEntryInput {
+  /** The repository file that holds the entry now; it moves to the other file at the same root. */
+  location: RecordLocation;
+  /** Bundle id. */
+  bundleId: string;
+  /** Tool key of the entry. */
+  tool: string;
+}
+
+/** Outcome of {@link InstallRecordService.moveEntry}. */
+export interface MoveEntryResult {
+  /** The file the entry left. */
+  from: RecordLocation;
+  /** The file the entry is in now. */
+  to: RecordLocation;
+  /** Non-fatal problems from the saves, for the caller to log. */
+  warnings: string[];
+}
+
+/** The configured source a remapped id points to: the C1 fields of `RecordSourceInput` without the key. */
+export interface RecordSourceDescriptor {
+  /** A `SourceType` value. */
+  type: string;
+  /** Source URL; credentials are removed before it is recorded (NFR4.5). */
+  url: string;
+  branch?: string;
+  collectionsPath?: string;
+  indexFile?: string;
+  authMode?: string;
+  credentialRef?: string;
+  /** Any other field is dropped, never recorded. */
+  [key: string]: unknown;
+}
+
+/** Input of {@link InstallRecordService.remapSource}. */
+export interface RemapSourceInput {
+  /** Repository root (git root) whose two record files are rewritten. */
+  root: string;
+  /** Source id to replace. */
+  from: string;
+  /** Source id to use instead. */
+  to: string;
+  /** Fields recorded under `sources.<to>`. */
+  descriptor: RecordSourceDescriptor;
+}
+
+/** Outcome of {@link InstallRecordService.remapSource}. */
+export interface RemapSourceResult {
+  /** Record files that changed and were saved, committed first; empty when nothing referred to `from`. */
+  changed: RecordLocation[];
+  /** Non-fatal problems from the saves, for the caller to log. */
   warnings: string[];
 }
 
@@ -229,10 +329,11 @@ const copyRecordedFile = (file: RecordedFile): RecordedFile => {
 };
 
 /**
- * Every installed path listed by any entry of the given records.
+ * Every installed path listed by any entry of the given records (keep-if-listed, NFR4.9).
  * @param records - Records to scan.
+ * @returns The root-relative paths.
  */
-const listedPaths = (records: readonly InstallRecord[]): Set<string> => {
+export const listedPaths = (records: readonly InstallRecord[]): Set<string> => {
   const listed = new Set<string>();
   for (const record of records) {
     for (const bundle of Object.values(record.bundles)) {
@@ -244,6 +345,57 @@ const listedPaths = (records: readonly InstallRecord[]): Set<string> => {
     }
   }
   return listed;
+};
+
+/**
+ * Whether two recorded sources have the same fields and values.
+ * @param left - First source.
+ * @param right - Second source.
+ */
+const isSameSource = (left: SourceRecord, right: SourceRecord): boolean => {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  return [...keys].every((key) => left[key] === right[key]);
+};
+
+/**
+ * Remap one source id in a loaded record, in memory (BR11.9): every entry
+ * using `from` takes `to`, and `sources.<from>` becomes `sources.<to>` with
+ * the given fields. Every entry using `to` afterwards takes the source's
+ * type as its `sourceType`, so it matches `sources.<to>.type`. A record
+ * already at `to` with the same fields and types is left alone.
+ * @param record - Record to change.
+ * @param from - Source id to replace.
+ * @param to - Source id to use instead.
+ * @param source - Sanitized source to record under `to`.
+ * @returns Whether the record changed.
+ */
+const remapInRecord = (record: InstallRecord, from: string, to: string, source: SourceRecord): boolean => {
+  if (!Object.hasOwn(record.sources, from)) {
+    return false;
+  }
+  let changed = false;
+  for (const bundle of Object.values(record.bundles)) {
+    for (const entry of Object.values(bundle.tools)) {
+      if (entry.sourceId !== from && entry.sourceId !== to) {
+        continue;
+      }
+      if (entry.sourceId !== to || entry.sourceType !== source.type) {
+        changed = true;
+      }
+      entry.sourceId = to;
+      entry.sourceType = source.type;
+    }
+  }
+  if (from !== to) {
+    delete record.sources[from];
+    changed = true;
+  }
+  const current = Object.hasOwn(record.sources, to) ? record.sources[to] : undefined;
+  if (current === undefined || !isSameSource(current, source)) {
+    record.sources[to] = source;
+    changed = true;
+  }
+  return changed;
 };
 
 /** Records installs in the shared install record (contract C3). */
@@ -279,18 +431,6 @@ export class InstallRecordService {
         throw recordError('RECORD.MALFORMED', { detail: `${name} ${JSON.stringify(value)} cannot be recorded` });
       }
     }
-  }
-
-  /**
-   * The other repository file at the same root, if the location is a repository file.
-   * @param location - Target location.
-   */
-  private otherLocation(location: RecordLocation): RecordLocation | undefined {
-    if (location.level !== 'repository') {
-      return undefined;
-    }
-    const [committed, localOnly] = repositoryLocations(location.root);
-    return location.commitMode === 'local-only' ? committed : localOnly;
   }
 
   /**
@@ -477,6 +617,34 @@ export class InstallRecordService {
   }
 
   /**
+   * Tool entries of the given record files in file order, one per level,
+   * root, bundle and tool: an entry in both repository files at one root (an
+   * interrupted `moveEntry`) is taken from the committed file.
+   * @param locations - Record files to read.
+   * @param bundleId - Only this bundle's entries, when given.
+   * @param tool - Only this tool's entries, when given.
+   * @throws {RegistryError} Any `RECORD.*` error from loading a file.
+   */
+  private async locateEntries(locations: readonly RecordLocation[], bundleId?: string, tool?: string): Promise<LocatedToolEntry[]> {
+    const found = new Map<string, LocatedToolEntry>();
+    for (const location of locations) {
+      const { record } = await this.store.load(location);
+      const bundles = Object.entries(record.bundles).filter(([id]) => bundleId === undefined || id === bundleId);
+      for (const [id, bundle] of bundles) {
+        for (const [key, entry] of Object.entries(bundle.tools).filter(([name]) => tool === undefined || name === tool)) {
+          const dedupeKey = JSON.stringify([location.level, location.root, id, key]);
+          const existing = found.get(dedupeKey);
+          if (existing !== undefined && (existing.location.commitMode !== 'local-only' || location.commitMode === 'local-only')) {
+            continue;
+          }
+          found.set(dedupeKey, { location, bundleId: id, tool: key, entry });
+        }
+      }
+    }
+    return [...found.values()];
+  }
+
+  /**
    * Record that a tool installed a bundle (workflow W1 steps 6–12).
    *
    * Loads both repository files, replaces only `bundles.<bundleId>.tools.<tool>`
@@ -499,7 +667,7 @@ export class InstallRecordService {
     const source: SourceRecord = sanitizeSource(input.source);
     const { location, bundleId, tool } = input;
     const target = await this.store.load(location);
-    const otherLocation = this.otherLocation(location);
+    const otherLocation = otherRepositoryLocation(location);
     const other = otherLocation === undefined ? undefined : await this.store.load(otherLocation);
     const files = await this.toRecordedFiles(location.root, input.writtenPaths, input.workspaceRoot);
 
@@ -584,7 +752,7 @@ export class InstallRecordService {
   public async recordUninstall(input: { location: RecordLocation; bundleId: string; tool: string }): Promise<RecordInstallResult> {
     const { location, bundleId, tool } = input;
     const first = await this.store.load(location);
-    const otherLocation = this.otherLocation(location);
+    const otherLocation = otherRepositoryLocation(location);
     const loaded = otherLocation === undefined ? [first] : [first, await this.store.load(otherLocation)];
 
     const changed: { file: LoadedRecord; entry: ToolEntry }[] = [];
@@ -627,32 +795,186 @@ export class InstallRecordService {
   }
 
   /**
+   * Uninstall one tool's entry and delete its files (FR4.1, NFR4.9, NFR4.13):
+   * the entry's files that no longer match their recorded checksum, or are
+   * missing, are found first; then {@link recordUninstall} removes the entry
+   * and saves; then {@link deleteSuperseded} removes its files except those
+   * another entry still lists, the modified or missing ones and `keep`. Works
+   * for a repository file (both files at its root) and for a user record.
+   * The `info/exclude` update for a local-only file stays with the caller.
+   * @param input - The file holding the entry, the bundle id, the tool and extra paths to keep.
+   * @returns The change, the removed and kept files, the modified files kept, and the warnings.
+   * @throws {RegistryError} `RECORD.ENTRY_NOT_FOUND` when no file has the
+   * entry (nothing is changed); any `RECORD.*` error from loading or saving.
+   */
+  public async uninstallEntry(input: UninstallEntryInput): Promise<UninstallEntryResult> {
+    const { location, bundleId, tool } = input;
+    const other = otherRepositoryLocation(location);
+    const recorded: RecordedFile[] = [];
+    for (const file of other === undefined ? [location] : [location, other]) {
+      const { record } = await this.store.load(file);
+      const bundle = Object.hasOwn(record.bundles, bundleId) ? record.bundles[bundleId] : undefined;
+      recorded.push(...(bundle !== undefined && Object.hasOwn(bundle.tools, tool) ? bundle.tools[tool].files : []));
+    }
+    const changedOrMissing = new Set(await findModifiedFiles(this.fs, location.root, recorded));
+    const change = await this.recordUninstall({ location, bundleId, tool });
+    const isKept = (recordedPath: string): boolean => changedOrMissing.has(recordedPath) || input.keep?.has(recordedPath) === true;
+    const removal = await this.deleteSuperseded({
+      location: change.location,
+      deletedFiles: change.deletedFiles.filter((recordedPath) => !isKept(recordedPath))
+    });
+    const keptOwn = change.deletedFiles.filter((recordedPath) => isKept(recordedPath));
+    const modified: string[] = [];
+    for (const recordedPath of keptOwn.filter((candidate) => changedOrMissing.has(candidate))) {
+      const stat = await this.fs.lstat(path.join(change.location.root, ...recordedPath.split('/'))).catch(() => undefined);
+      if (stat !== undefined) {
+        modified.push(recordedPath);
+      }
+    }
+    return {
+      change,
+      deleted: removal.deleted,
+      kept: [...change.keptSharedFiles, ...keptOwn],
+      modified,
+      warnings: [...change.warnings, ...removal.warnings]
+    };
+  }
+
+  /**
+   * Move one tool's entry between the committed and the local-only repository
+   * file, unchanged (BR11.5, NFR7.3): its version, `sourceId`, `sourceType`,
+   * `installedAt` and files with their checksums are copied as they are, with
+   * its source. Nothing is hashed and no sibling is synced.
+   *
+   * The target file is saved first, then the file the entry left, which is
+   * removed (with its `info/exclude` line, for the local-only file) when no
+   * bundle is left. When the second save fails, both files hold the entry;
+   * the next `moveEntry` or `recordInstall` of it leaves one copy. The target
+   * file's entry for the same bundle and tool, and its `sources.<sourceId>`,
+   * are overwritten without comparing them: that is how an interrupted move
+   * is repaired.
+   * @param input - The file holding the entry, the bundle id and the tool.
+   * @returns The two files and the save warnings.
+   * @throws {RegistryError} `RECORD.ENTRY_NOT_FOUND` when the file has no such
+   * entry, or `RECORD.MALFORMED` for a location that is not a repository file
+   * (nothing is changed); any `RECORD.*` error from loading or saving.
+   */
+  public async moveEntry(input: MoveEntryInput): Promise<MoveEntryResult> {
+    const { location, bundleId, tool } = input;
+    const targetLocation = otherRepositoryLocation(location);
+    if (targetLocation === undefined) {
+      throw recordError('RECORD.MALFORMED', { file: path.basename(location.path), detail: 'only a repository entry can change commit mode' });
+    }
+    const from = await this.store.load(location);
+    const to = await this.store.load(targetLocation);
+    const entry = this.removeEntry(from.record, bundleId, tool);
+    if (entry === undefined) {
+      throw recordError('RECORD.ENTRY_NOT_FOUND', {
+        file: path.basename(location.path),
+        detail: `no entry for bundle ${JSON.stringify(bundleId)} and tool ${JSON.stringify(tool)}`,
+        context: { bundleId, tool }
+      });
+    }
+    // The store's load checked that the source exists.
+    const source = from.record.sources[entry.sourceId];
+    this.dropUnusedSource(from.record, entry.sourceId);
+    if (!Object.hasOwn(to.record.bundles, bundleId)) {
+      to.record.bundles[bundleId] = createBundle();
+    }
+    to.record.bundles[bundleId].tools[tool] = entry;
+    to.record.sources[entry.sourceId] = source;
+
+    const saved = await this.store.save(targetLocation, to.record);
+    const warnings = [...saved.warnings, ...(await this.saveOther(from))];
+    return { from: location, to: targetLocation, warnings };
+  }
+
+  /**
+   * Rewrite a source id in both repository files at a root (BR11.9, NFR4.15).
+   *
+   * Both files are loaded first, so a `RECORD.*` error on either stops the
+   * remap with nothing saved. In each file `sources.<from>` becomes
+   * `sources.<to>` with the descriptor's sanitized fields, and every entry
+   * whose `sourceId` is `from` takes `to`, with the descriptor's type as its
+   * `sourceType`. The committed file is saved first,
+   * then the local-only one, each only when it changed. Running it again is a
+   * no-op, so a remap whose second save failed is repaired by the next one.
+   * @param input - Root, the two ids and the source fields for `to`.
+   * @returns The files that changed and the save warnings.
+   * @throws {RegistryError} `RECORD.MALFORMED` for an id that cannot be a key,
+   * a type that is not a source type, or a descriptor without a type or url;
+   * any `RECORD.*` error from loading (nothing saved) or saving.
+   */
+  public async remapSource(input: RemapSourceInput): Promise<RemapSourceResult> {
+    const { root, from, to } = input;
+    for (const [name, value] of [['from', from], ['to', to]] as const) {
+      if (typeof value !== 'string' || value === '' || FORBIDDEN_KEYS.has(value)) {
+        throw recordError('RECORD.MALFORMED', { detail: `source id ${name} ${JSON.stringify(value)} cannot be recorded` });
+      }
+    }
+    if (!(RECORD_SOURCE_TYPES as readonly string[]).includes(input.descriptor.type)) {
+      throw recordError('RECORD.MALFORMED', { detail: `source type ${JSON.stringify(input.descriptor.type)} is not a source type` });
+    }
+    const source = sanitizeSource(input.descriptor);
+    const [committedLocation, localOnlyLocation] = repositoryLocations(root);
+    const committedFile = await this.store.load(committedLocation);
+    const loaded = [committedFile, await this.store.load(localOnlyLocation)];
+
+    const changed = loaded.filter((file) => remapInRecord(file.record, from, to, source));
+    const warnings: string[] = [];
+    for (const file of changed) {
+      warnings.push(...(await this.store.save(file.location, file.record)).warnings);
+    }
+    return { changed: changed.map((file) => file.location), warnings };
+  }
+
+  /**
    * One status row per (bundle, tool) entry of the given record files, sorted
    * by bundle, then tool, then record path (BR9.2). Every file is loaded and
-   * checked first; a missing file has no rows.
+   * checked first; a missing file has no rows. An entry in both repository
+   * files at one root (an interrupted `moveEntry`) is listed once, from the
+   * committed file.
    * @param locations - Record files to list, e.g. `RecordSelection.locations`.
    * @returns The rows.
    * @throws {RegistryError} Any `RECORD.*` error from loading a file.
    */
   public async listEntries(locations: readonly RecordLocation[]): Promise<StatusRow[]> {
-    const rows: StatusRow[] = [];
-    for (const location of locations) {
-      const { record } = await this.store.load(location);
-      for (const [bundleId, bundle] of Object.entries(record.bundles)) {
-        for (const [tool, entry] of Object.entries(bundle.tools)) {
-          rows.push({
-            bundleId,
-            tool,
-            level: location.level,
-            version: entry.version,
-            record: location.path,
-            needsReinstall: tool === UNKNOWN_TOOL_NAME || entry.needsReinstall === true
-          });
-        }
-      }
-    }
+    const rows: StatusRow[] = (await this.listToolEntries(locations)).map(({ location, bundleId, tool, entry }) => ({
+      bundleId,
+      tool,
+      level: location.level,
+      version: entry.version,
+      record: location.path,
+      needsReinstall: tool === UNKNOWN_TOOL_NAME || entry.needsReinstall === true
+    }));
     return rows.toSorted((left, right) =>
       compareCodeUnits(left.bundleId, right.bundleId) || compareCodeUnits(left.tool, right.tool) || compareCodeUnits(left.record, right.record));
+  }
+
+  /**
+   * A bundle's tool entries in the given record files (BR6.5, BR11.2), in file
+   * order; an entry in both repository files at one root is listed once, from
+   * the committed file. Works for any list of files, a single user record included.
+   * @param locations - Record files to search, committed first.
+   * @param bundleId - Bundle id.
+   * @param tool - Only this tool's entry, when given.
+   * @returns The entries found; empty when no file has the bundle.
+   * @throws {RegistryError} Any `RECORD.*` error from loading a file.
+   */
+  public findEntries(locations: readonly RecordLocation[], bundleId: string, tool?: string): Promise<LocatedToolEntry[]> {
+    return this.locateEntries(locations, bundleId, tool);
+  }
+
+  /**
+   * Every tool entry of every bundle in the given record files, in file
+   * order; an entry in both repository files at one root is listed once, from
+   * the committed file (stale cleanup BR12.2, status BR9.2).
+   * @param locations - Record files to list.
+   * @returns The entries.
+   * @throws {RegistryError} Any `RECORD.*` error from loading a file.
+   */
+  public listToolEntries(locations: readonly RecordLocation[]): Promise<LocatedToolEntry[]> {
+    return this.locateEntries(locations);
   }
 
   /**
@@ -661,17 +983,11 @@ export class InstallRecordService {
    * @param locations - Record files to search, committed first.
    * @param bundleId - Bundle id.
    * @param tool - Tool key.
-   * @returns The first file holding the entry, or `undefined` when none does.
+   * @returns The file holding the entry (the committed one when both do), or `undefined` when none does.
    * @throws {RegistryError} Any `RECORD.*` error from loading a file.
    */
   public async holdingLocation(locations: readonly RecordLocation[], bundleId: string, tool: string): Promise<RecordLocation | undefined> {
-    for (const location of locations) {
-      const { record } = await this.store.load(location);
-      if (Object.hasOwn(record.bundles, bundleId) && Object.hasOwn(record.bundles[bundleId].tools, tool)) {
-        return location;
-      }
-    }
-    return undefined;
+    return (await this.findEntries(locations, bundleId, tool))[0]?.location;
   }
 
   /**
@@ -747,7 +1063,7 @@ export class InstallRecordService {
     for (const change of changes) {
       let listed = listedByRecord.get(change.location.path);
       if (listed === undefined) {
-        const other = this.otherLocation(change.location);
+        const other = otherRepositoryLocation(change.location);
         const locations = other === undefined ? [change.location] : [change.location, other];
         const records: InstallRecord[] = [];
         for (const location of locations) {

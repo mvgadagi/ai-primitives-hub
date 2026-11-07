@@ -67,7 +67,7 @@ At repository scope, `install` records the bundle in a new install record at the
 - Both record files are read before anything is written. A record that cannot be read stops the install with a `RECORD.*` error (exit 1) that names the file, and writes nothing. Run `ai-primitives-hub explain <code>` for the fix.
 - An existing `prompt-registry.lock.json` is left untouched. User-scope installs are unchanged.
 
-At repository scope, `uninstall` removes the target's tool entry from the install record and deletes its files, keeping any file another entry still lists. The record file is deleted when no bundles remain. Bundles installed before this change, which only `prompt-registry.lock.json` lists, are still uninstalled from that file.
+At repository scope, `uninstall` removes the target's tool entry from the install record and deletes its files, keeping any file another entry still lists and any file you edited after the install (a warning names each one). The record file is deleted when no bundles remain. Bundles installed before this change, which only `prompt-registry.lock.json` lists, are still uninstalled from that file.
 
 Every command that reads or changes the record ends its text output with `Record: <level> <path>`, and its `-o json` data carries `level` and `records` (the record files read).
 
@@ -79,7 +79,7 @@ Every command that reads or changes the record ends its text output with `Record
 
 `prompt-registry.lock.json` files and user-scope installs keep their current behaviour.
 
-The VS Code extension lists bundles from the install record as repository-scope installs, and refuses to uninstall, update, move or switch the commit mode of those entries, since the CLI manages them (`RECORD.CLI_MANAGED`).
+The VS Code extension uses the same install record. It records its installs under its own tool (`vscode`, `vscode-insiders`, `kiro` or `windsurf`, from the editor it runs in), so a bundle installed by the extension and by the CLI for another tool keeps both entries. The extension installs, updates, uninstalls, moves and switches the commit mode of its own tool's entries only. Entries of other tools are listed with their tool and are read-only; changing one shows `RECORD.CLI_MANAGED` with the CLI command to use. An update writes the new version in place, keeps files you edited, and moves tools that share the same files (for example `vscode`, `vscode-insiders` and `copilot-cli` in `.github/`) to the new version. When the extension rewrites a bundle that an old `prompt-registry.lock.json` also lists, it removes that old entry. "Clean Up Stale Repository Bundles" lists one row per bundle and tool, offers only entries whose files are all missing, and removes the entries without deleting files.
 
 ## Plugin Create (CLI)
 
