@@ -22,6 +22,13 @@
  * for more than one tool (BR7.1). Record outputs carry `level` / `records`
  * and the `Record:` text line.
  *
+ * With zero or several configured targets and no `--target`,
+ * `uninstall <id>` lets the record decide (BR23.3): the level comes from
+ * `--scope` or the default rule, a bundle recorded for one tool goes through
+ * the target mapped to that tool, and a lone `unknown` entry is removed
+ * keeping its files. Every other mode needs `--target`, unless exactly one
+ * target is configured (BR23.2).
+ *
  * Repository-scope targets otherwise delegate to `UninstallPipeline`
  * (`@ai-primitives-hub/app`), which already encapsulates the
  * commit/local-only two-file split (see its module doc). User/workspace
@@ -39,50 +46,54 @@ import {
   type MigrationReport,
   readLockfile,
   removeBundleEntry,
+  type StatusRow,
   type TargetWriter,
   TransformerRegistry,
   UninstallPipeline,
   type UninstallResult,
   writeLockfile,
 } from '@ai-primitives-hub/app';
-import type {
-  Target,
+import {
+  type RecordLocation,
+  type Target,
+  UNKNOWN_TOOL_NAME,
 } from '@ai-primitives-hub/core';
 import {
   type RepositoryCommitMode,
   RepositoryScopeWriter,
   RepositoryScopeWriterAdapter,
-  TargetStateStore,
 } from '@ai-primitives-hub/infra';
 import {
   Command,
-  type CommandDefinition,
   type Context,
   createLayoutLoader,
-  defineCommand,
   failWith,
   findProjectLockfile,
   formatOutput,
+  inferTargetName,
   loadTargets,
   lockfilePathForTarget,
   Option,
   type OutputFormat,
   type PreparedRecordSelection,
   type PreparedRepositoryUninstall,
+  prepareRecordDecision,
   prepareRecordSelection,
   prepareRepositoryUninstall,
   prepareUninstallForTarget,
+  prepareUnknownUninstall,
   readTargetsSafely,
-  type RecordOutputFields,
+  type RecordDecision,
+  recordedTools,
   recordOutputFields,
+  type RecordOutputFields,
   recordRepositoryUninstall,
   recordUnknownUninstall,
   RegistryError,
   renderMigration,
   renderRecordLine,
+  resolveCommandTarget,
   resolveEffectiveTarget,
-  resolveTarget,
-  resolveTargetName,
   validateInputs,
   writerEnv,
 } from '../framework';
@@ -116,7 +127,8 @@ export interface UninstallOptions {
 
 /**
  * Detect uninstall context from the project environment (symmetric with install).
- * Fills in `opts.lockfile` and `opts.target` when they can be inferred.
+ * Fills in `opts.lockfile` when it can be inferred; the target is inferred
+ * later (`inferTargetName`, BR23.2).
  * @param opts Uninstall options (mutated in-place).
  * @param ctx CLI context.
  */
@@ -127,42 +139,103 @@ async function detectUninstallContext(opts: UninstallOptions, ctx: Context): Pro
       opts.lockfile = foundLock;
     }
   }
+}
 
-  if (!opts.target || opts.target.length === 0) {
-    const targets = await readTargetsSafely(
-      loadTargets(ctx)
-    );
-    if (targets.length === 1) {
-      opts.target = targets[0].name;
-    }
+/**
+ * The refusal of `uninstall <id>` without `--target` for a bundle recorded
+ * for several tools (BR7.1).
+ * @param bundleId Bundle to uninstall.
+ * @param tools Its recorded tools.
+ * @returns `USAGE.MISSING_FLAG` listing the tools.
+ */
+const multiToolError = (bundleId: string, tools: readonly string[]): RegistryError => new RegistryError({
+  code: 'USAGE.MISSING_FLAG',
+  message: `uninstall: bundle "${bundleId}" is installed for several tools (${tools.join(', ')}); pass --target to choose one`,
+  hint: `Example: ai-primitives-hub uninstall --bundle ${bundleId} --target <name of a ${tools[0]} target>`,
+  context: { bundle: bundleId, tools: [...tools] }
+});
+
+/**
+ * Refuse `uninstall <id>` without `--target` when the bundle has entries for
+ * more than one tool in the decision's record (BR7.1).
+ * @param rows Rows of the record decision.
+ * @param bundleId Bundle to uninstall.
+ * @throws {RegistryError} `USAGE.MISSING_FLAG` listing the tools; nothing was removed.
+ */
+function assertSingleTool(rows: readonly StatusRow[], bundleId: string): void {
+  const tools = recordedTools(rows, bundleId);
+  if (tools.length > 1) {
+    throw multiToolError(bundleId, tools);
   }
 }
 
 /**
- * Refuse `uninstall <id>` without `--target` when the bundle has entries for
- * more than one tool in the selected repository record (BR7.1).
- * @param ctx CLI context.
- * @param bundleId Bundle to uninstall.
- * @param scope `--scope`, when given.
- * @throws {RegistryError} `USAGE.MISSING_FLAG` listing the tools; nothing was removed.
- * @throws {RegistryError} A `RECORD.*` error naming the file.
+ * Whether `uninstall` removes one bundle: `<bundle-id>` given, without `--all`
+ * or `--lockfile`.
+ * @param opts Uninstall options.
+ * @returns `true` in bundle mode.
  */
-async function refuseMultiToolUninstall(ctx: Context, bundleId: string, scope?: UninstallOptions['scope']): Promise<void> {
-  const { selection, service } = await prepareRecordSelection(ctx, { command: 'uninstall', scope });
-  if (selection.level !== 'repository' && (selection.level !== 'user' || selection.locations.length === 0)) {
-    return;
+const isBundleMode = (opts: UninstallOptions): boolean => opts.bundle !== undefined && opts.bundle.length > 0 && opts.all !== true
+  && (opts.lockfile === undefined || opts.lockfile.length === 0);
+
+/**
+ * `uninstall <bundle-id>` with no inferred target: zero or several targets
+ * configured and no `--target` (BR23.3). The record, already selected
+ * read-only (`--scope`, then the default rule) and refused for several tools
+ * (BR7.1), decides:
+ * - a lone `unknown` entry: removed with its files kept, through a
+ *   target-free prepare that migrates the level first (BR21.3);
+ * - one tool: uninstalled through the configured target mapped to it
+ *   (BR6.4), with the mapping note in `warnings`; with no such target,
+ *   `USAGE.MISSING_FLAG` and nothing removed.
+ * Nothing is migrated or written before the record decides (NFR4.27).
+ * @param opts Uninstall options; `opts.bundle` is set.
+ * @param ctx CLI context.
+ * @param fmt Output format.
+ * @param decision The read-only record decision, already checked for several tools.
+ * @returns Exit code, or `undefined` when the record holds no entry for the bundle (the caller then needs a target, BR23.2).
+ * @throws {RegistryError} `USAGE.MISSING_FLAG`, or a `RECORD.*` error naming the file.
+ */
+async function uninstallWithoutTarget(
+  opts: UninstallOptions,
+  ctx: Context,
+  fmt: OutputFormat,
+  decision: RecordDecision
+): Promise<number | undefined> {
+  const bundleId = opts.bundle as string;
+  let current = decision;
+  // A migration can change the bundle's entries once; the second pass decides on the migrated record.
+  for (let pass = 0; pass < 2; pass++) {
+    const tools = recordedTools(current.rows, bundleId);
+    if (tools.length === 0) {
+      return undefined;
+    }
+    const [tool] = tools;
+    if (tool === UNKNOWN_TOOL_NAME) {
+      const prepared = await prepareUnknownUninstall(ctx, current, bundleId, { dryRun: opts.dryRun });
+      if ('changed' in prepared) {
+        // The migrated record is refused for several tools too (BR7.1).
+        assertSingleTool(prepared.changed.rows, bundleId);
+        current = prepared.changed;
+        continue;
+      }
+      return performUnknownBundleUninstall({ opts, ctx, fmt }, prepared.uninstall, bundleId);
+    }
+    const { selection, fs } = current.prepared;
+    const targets = await readTargetsSafely(loadTargets(ctx));
+    const mapping = await mapToolToTarget({ fs, tool, level: selection.level, gitRoot: selection.root, targets, cwd: ctx.cwd() });
+    if ('skip' in mapping) {
+      throw new RegistryError({
+        code: 'USAGE.MISSING_FLAG',
+        message: `uninstall: no ${tool} target configured; add one with target add, or pass --target`,
+        hint: `Example: ai-primitives-hub target add <name> --type ${tool}`,
+        context: { bundle: bundleId, tool, reason: mapping.skip }
+      });
+    }
+    const target = resolveEffectiveTarget(ctx, mapping.target, opts);
+    return performBundleUninstall(opts, target, ctx, fmt, false, mapping.note === undefined ? [] : [mapping.note]);
   }
-  const tools = [...new Set((await service.listEntries(selection.locations))
-    .filter((row) => row.bundleId === bundleId)
-    .map((row) => row.tool))];
-  if (tools.length > 1) {
-    throw new RegistryError({
-      code: 'USAGE.MISSING_FLAG',
-      message: `uninstall: bundle "${bundleId}" is installed for several tools (${tools.join(', ')}); pass --target to choose one`,
-      hint: `Example: ai-primitives-hub uninstall --bundle ${bundleId} --target <name of a ${tools[0]} target>`,
-      context: { bundle: bundleId, tools }
-    });
-  }
+  return undefined;
 }
 
 /**
@@ -203,7 +276,7 @@ export class UninstallCommand extends BaseUninstallCommand {
         -o, --output <format> Output format (text, json, yaml, ndjson)
 
       Examples:
-        ai-primitives-hub uninstall --lockfile prompt-registry.lock.json --target my-vscode
+        ai-primitives-hub uninstall --lockfile ai-primitives-hub.lock.json --target my-vscode
         ai-primitives-hub uninstall --all --target my-vscode
         ai-primitives-hub uninstall --dry-run --target my-vscode
     `
@@ -234,12 +307,16 @@ export class UninstallCommand extends BaseUninstallCommand {
     };
 
     const typedTarget = opts.target !== undefined && opts.target.length > 0;
+    const bundleMode = isBundleMode(opts);
+    // Without --target, the record is selected read-only once: it is checked
+    // here and decides below when no target is inferred (BR23.3).
+    let decision: RecordDecision | undefined;
     try {
       // BR7.1: checked before the target is inferred, so a single configured
       // target never silently picks one of several recorded tools.
-      if (!typedTarget && opts.bundle !== undefined && opts.bundle.length > 0 && opts.all !== true
-        && (opts.lockfile === undefined || opts.lockfile.length === 0)) {
-        await refuseMultiToolUninstall(ctx, opts.bundle, opts.scope);
+      if (!typedTarget && bundleMode) {
+        decision = await prepareRecordDecision(ctx, { command: 'uninstall', scope: opts.scope });
+        assertSingleTool(decision.rows, opts.bundle as string);
       }
     } catch (err) {
       if (err instanceof RegistryError) {
@@ -257,16 +334,22 @@ export class UninstallCommand extends BaseUninstallCommand {
         message: 'uninstall: provide <bundle-id>, --lockfile <path>, or --all',
         hint: 'Examples:\n'
           + '  ai-primitives-hub uninstall <bundle-id> --target my-vscode\n'
-          + '  ai-primitives-hub uninstall --lockfile prompt-registry.lock.json\n'
+          + '  ai-primitives-hub uninstall --lockfile ai-primitives-hub.lock.json\n'
           + '  ai-primitives-hub uninstall --all\n\n'
           + 'Note: Lockfile is auto-detected in current directory and parent directories.'
       }));
     }
 
     try {
-      const targetName = await resolveTargetName(opts.target, 'uninstall', ctx, () => loadTargets(ctx));
-      const configuredTarget = await resolveTarget(targetName, 'uninstall', ctx, () => loadTargets(ctx));
-      const target = resolveEffectiveTarget(ctx, configuredTarget, opts);
+      const targetName = await inferTargetName(ctx, opts.target);
+      if (decision !== undefined && targetName === undefined) {
+        const code = await uninstallWithoutTarget(opts, ctx, fmt, decision);
+        if (code !== undefined) {
+          return code;
+        }
+      }
+
+      const target = await resolveCommandTarget(ctx, 'uninstall', targetName, opts);
 
       if (opts.all === true) {
         return await performAllUninstall(opts, target, ctx, fmt);
@@ -476,18 +559,37 @@ async function findAllBundleEntries(
  * @param target Target the bundle is uninstalled from.
  * @param bundleId Bundle id.
  * @param files Paths that would be removed.
+ * @param extra Notes and the record a real run would change; none for the old lockfile path.
+ * @param extra.warnings Non-fatal notes to report, such as tool-to-target mapping notes (BR6.4).
+ * @param extra.record The `level` / `records` fields and `Record:` line naming the file a real run would change (NFR4.30).
  * @returns Exit code.
  */
-function renderBundleDryRun(ctx: Context, fmt: OutputFormat, target: Target, bundleId: string, files: readonly string[]): number {
+function renderBundleDryRun(
+  ctx: Context,
+  fmt: OutputFormat,
+  target: Target,
+  bundleId: string,
+  files: readonly string[],
+  extra: { warnings?: readonly string[]; record?: RecordOutputFields } = {}
+): number {
+  const { warnings = [], record } = extra;
   formatOutput({
     ctx,
     command: 'uninstall',
     output: fmt,
     status: 'ok',
-    data: { dryRun: true, target: target.name, bundle: bundleId, files: [...files] },
+    data: {
+      dryRun: true,
+      ...(record === undefined ? {} : { level: record.level, records: [...record.records] }),
+      target: target.name,
+      bundle: bundleId,
+      files: [...files]
+    },
+    warnings: warnings.length > 0 ? [...warnings] : undefined,
     textRenderer: (d) => `[dry-run] Would uninstall bundle "${d.bundle}" from target "${d.target}":\n`
       + `  Files: ${d.files.join(', ')}\n`
       + 'Run without --dry-run to apply.\n'
+      + (record === undefined ? '' : renderRecordLine(record))
   });
   return 0;
 }
@@ -547,6 +649,7 @@ function renderBundleUninstalled(ctx: Context, fmt: OutputFormat, target: Target
  * @param ctx CLI context.
  * @param fmt Output format.
  * @param typedTarget Whether `--target` was typed; only a plain uninstall removes a lone `unknown` entry (BR21.3).
+ * @param notes Tool-to-target mapping notes, shown in `warnings` (BR6.4).
  * @returns Exit code.
  */
 async function performBundleUninstall(
@@ -554,7 +657,8 @@ async function performBundleUninstall(
   target: Target,
   ctx: Context,
   fmt: OutputFormat,
-  typedTarget: boolean
+  typedTarget: boolean,
+  notes: readonly string[] = []
 ): Promise<number> {
   const bundleId = opts.bundle as string;
   // The record files are loaded and the level migrated first: a RECORD.*
@@ -565,7 +669,7 @@ async function performBundleUninstall(
   if (prepared !== undefined) {
     const recordedFiles = prepared.entries.get(bundleId);
     if (recordedFiles !== undefined) {
-      return await performRecordBundleUninstall({ opts, target, ctx, fmt }, prepared, bundleId, recordedFiles);
+      return await performRecordBundleUninstall({ opts, target, ctx, fmt }, prepared, bundleId, recordedFiles, notes);
     }
     if (!typedTarget && prepared.loneUnknown?.has(bundleId) === true) {
       return await performUnknownBundleUninstall({ opts, target, ctx, fmt }, prepared, bundleId);
@@ -615,9 +719,6 @@ async function performBundleUninstall(
     result = await runUserScopeUninstall(bundleId, lockPath, target, ctx, writerFactory(target));
   }
 
-  // Update target state
-  await updateTargetState(ctx, target.name, bundleId);
-
   return renderBundleUninstalled(ctx, fmt, target, { bundleId, removed: result.removed, lockfile: lockPath });
 }
 
@@ -630,33 +731,53 @@ interface UninstallRun {
 }
 
 /**
+ * The record file a real uninstall would remove the bundle's entry from: the
+ * file of the level holding the entry for the prepared tool (app's
+ * `holdingLocation`), else the prepared file. Read-only, for the dry run.
+ * @param prepared The level's record files, loaded and checked.
+ * @param bundleId Bundle to uninstall.
+ * @returns The file holding the entry for the prepared tool, else the prepared file.
+ */
+async function holdingRecordLocation(prepared: PreparedRepositoryUninstall, bundleId: string): Promise<RecordLocation> {
+  return await prepared.service.holdingLocation(prepared.locations, bundleId, prepared.tool) ?? prepared.location;
+}
+
+/**
  * Uninstall one bundle recorded in the repository install record
  * (`ai-primitives-hub.lock.json` / `.local.lock.json`) for the target's type.
  * @param run Options, target, context and output format.
  * @param prepared Both record files, loaded and checked.
  * @param bundleId Bundle to uninstall.
  * @param recordedFiles Its recorded root-relative paths, for the dry run.
+ * @param notes Tool-to-target mapping notes, shown in `warnings` (BR6.4).
  * @returns Exit code.
  */
 async function performRecordBundleUninstall(
   run: UninstallRun,
   prepared: PreparedRepositoryUninstall,
   bundleId: string,
-  recordedFiles: string[]
+  recordedFiles: string[],
+  notes: readonly string[] = []
 ): Promise<number> {
   const { opts, target, ctx, fmt } = run;
   if (opts.dryRun === true) {
-    return renderBundleDryRun(ctx, fmt, target, bundleId, recordedFiles);
+    // Name the file a real run would change (NFR4.30): the default rule may
+    // have picked the level, so the preview says which one.
+    const location = await holdingRecordLocation(prepared, bundleId);
+    return renderBundleDryRun(ctx, fmt, target, bundleId, recordedFiles, {
+      warnings: notes,
+      record: { level: location.level, records: [location.path] }
+    });
   }
 
   const recorded = await recordRepositoryUninstall(prepared, bundleId);
-  await updateTargetState(ctx, target.name, bundleId);
+  const warnings = [...notes, ...recorded.warnings];
 
   return renderBundleUninstalled(ctx, fmt, target, {
     bundleId,
     removed: recorded.removed,
     lockfile: recorded.lockfile,
-    warnings: recorded.warnings,
+    warnings,
     record: { level: prepared.location.level, records: [recorded.lockfile] },
     ...(prepared.migration === undefined ? {} : { migration: prepared.migration })
   });
@@ -666,28 +787,33 @@ async function performRecordBundleUninstall(
  * Plain `uninstall <bundle>` of a bundle whose only entry at the level is
  * `unknown` (BR21.3): the entry is removed and every file it listed is kept,
  * because the tool that wrote them is not known.
- * @param run Options, target, context and output format.
+ * @param run Options, context, output format and the target, when one was
+ *   resolved; with no target (BR23.3) the output names the level and record
+ *   instead of a target.
  * @param prepared The level's record files, loaded, checked and migrated.
  * @param bundleId Bundle to uninstall.
  * @returns Exit code.
  */
 async function performUnknownBundleUninstall(
-  run: UninstallRun,
+  run: Omit<UninstallRun, 'target'> & { target?: Target },
   prepared: PreparedRepositoryUninstall,
   bundleId: string
 ): Promise<number> {
   const { opts, target, ctx, fmt } = run;
+  const targetField = target === undefined ? {} : { target: target.name };
   const keptNote = (count: number): string =>
     `${String(count)} file${count === 1 ? '' : 's'} kept because their tool is unknown`;
   if (opts.dryRun === true) {
+    const recordFields = target === undefined ? { level: prepared.location.level, records: [prepared.location.path] } : undefined;
     formatOutput({
       ctx,
       command: 'uninstall',
       output: fmt,
       status: 'ok',
-      data: { dryRun: true, target: target.name, bundle: bundleId, files: [] as string[] },
+      data: { dryRun: true, ...targetField, ...recordFields, bundle: bundleId, files: [] as string[] },
       textRenderer: (d) => `[dry-run] Would remove the record entry of "${d.bundle}" (tool unknown); its files would be kept.\n`
         + 'Run without --dry-run to apply.\n'
+        + (d.level === undefined ? '' : renderRecordLine({ level: d.level, records: d.records ?? [] }))
     });
     return 0;
   }
@@ -701,7 +827,7 @@ async function performUnknownBundleUninstall(
     data: {
       level: prepared.location.level,
       records: [recorded.lockfile],
-      target: target.name,
+      ...targetField,
       bundle: bundleId,
       tool: 'unknown',
       removed: recorded.removed,
@@ -770,7 +896,6 @@ async function performRecordLockfileUninstall(run: UninstallRun, prepared: Prepa
     const recorded = await recordRepositoryUninstall(uninstall, bundleId);
     results.push({ id: bundleId, removed: recorded.removed.length });
     warnings.push(...recorded.warnings);
-    await updateTargetState(ctx, target.name, bundleId);
   }
 
   formatOutput({
@@ -994,17 +1119,6 @@ async function performAllUninstall(
     return 0;
   }
 
-  // Update target state (clear all bundles)
-  const stateStore = new TargetStateStore({
-    fs: ctx.fs,
-    statePath: path.join(ctx.cwd(), '.ai-primitives-hub', 'target-state.json')
-  });
-  await stateStore.save({
-    targetName: target.name,
-    lastInstalledBundles: [],
-    lastUsedAt: new Date().toISOString()
-  });
-
   formatOutput({
     ctx,
     command: 'uninstall',
@@ -1023,76 +1137,3 @@ async function performAllUninstall(
   });
   return 0;
 }
-
-/**
- * Update target state by removing bundle.
- * @param ctx CLI context.
- * @param targetName Target name.
- * @param bundleId Bundle ID to remove.
- */
-async function updateTargetState(ctx: Context, targetName: string, bundleId: string): Promise<void> {
-  const stateStore = new TargetStateStore({
-    fs: ctx.fs,
-    statePath: path.join(ctx.cwd(), '.ai-primitives-hub', 'target-state.json')
-  });
-  const existingState = await stateStore.load(targetName);
-  const newBundles = existingState?.lastInstalledBundles ?? [];
-  const bundleIndex = newBundles.findIndex((b) => b.bundleId === bundleId);
-  if (bundleIndex !== -1) {
-    newBundles.splice(bundleIndex, 1);
-  }
-  await stateStore.save({
-    targetName,
-    lastInstalledBundles: newBundles,
-    lastUsedAt: new Date().toISOString()
-  });
-}
-
-/**
- * Build the `uninstall` command.
- * @param opts - Command options.
- * @returns CommandDefinition wired to the framework adapter.
- */
-export const createUninstallCommand = (
-  opts: UninstallOptions = {}
-): CommandDefinition =>
-  defineCommand({
-    path: ['uninstall'],
-    description: 'Remove bundles from a configured target.',
-    category: 'Install & Manage',
-    run: async ({ ctx }: { ctx: Context }): Promise<number> => {
-      const fmt = opts.output ?? 'text';
-      const { bundle: noBundle, lockfile: noLockfile, all: noAll } = validateInputs(opts, { flags: ['bundle', 'lockfile', 'all'] });
-      if (noBundle && noLockfile && noAll) {
-        return failWith(ctx, fmt, 'uninstall', new RegistryError({
-          code: 'USAGE.MISSING_FLAG',
-          message: 'uninstall: provide <bundle-id>, --lockfile <path>, or --all',
-          hint: 'Examples:\n'
-            + '  ai-primitives-hub uninstall <bundle-id> --target my-vscode\n'
-            + '  ai-primitives-hub uninstall --lockfile prompt-registry.lock.json\n'
-            + '  ai-primitives-hub uninstall --all --target my-vscode'
-        }));
-      }
-
-      try {
-        const targetName = await resolveTargetName(opts.target, 'uninstall', ctx, () => loadTargets(ctx));
-        const configuredTarget = await resolveTarget(targetName, 'uninstall', ctx, () => loadTargets(ctx));
-        const target = resolveEffectiveTarget(ctx, configuredTarget, opts);
-
-        if (opts.all === true) {
-          return await performAllUninstall(opts, target, ctx, fmt);
-        }
-
-        if (opts.lockfile !== undefined && opts.lockfile.length > 0) {
-          return await performLockfileUninstall(opts, target, ctx, fmt);
-        }
-
-        return await performBundleUninstall(opts, target, ctx, fmt, opts.target !== undefined && opts.target.length > 0);
-      } catch (err) {
-        if (err instanceof RegistryError) {
-          return failWith(ctx, fmt, 'uninstall', err);
-        }
-        throw err;
-      }
-    }
-  });

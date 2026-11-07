@@ -1,13 +1,19 @@
 /**
  * `update` command — checks installed bundles for newer versions and upgrades them.
  *
- * Reference's version keys each lockfile entry by its own `target` field and
- * resolves a target per-entry. Our `LockfileBundleEntry` has no `target`
- * field (see `app/stores/json-lockfile-store.ts`'s module doc — repository
- * scope always writes to `.github/`, invariant of target), so `update`
- * instead resolves a single target for the whole run — same
- * flag/auto-detect pattern as `install`/`uninstall` — and updates every
- * bundle tracked by that target's lockfile.
+ * The install record (format 3.0.0) exists at repository level
+ * (`ai-primitives-hub.lock.json` / `ai-primitives-hub.local.lock.json` at the
+ * git root) and at user level (the shared `ai-primitives-hub.user.lock.json`),
+ * keyed by bundle and tool. `update` selects one level (`--lockfile`, then
+ * `--scope`, then the target's scope or the default rule) and updates every
+ * (bundle, tool) entry there, each through the configured target mapped to
+ * its tool; `--target` narrows the run to that target's tool (BR6.1, BR6.4).
+ * With zero or several targets and no `--target`, the record alone decides
+ * (BR23.3); when it holds no entry, `--target` is required (BR23.2).
+ *
+ * Bundles listed only in an older 2.0.0 file (`prompt-registry.*`, or the
+ * CLI's old user lockfile) are updated with the code below, on that file,
+ * through one resolved target (BR10.1).
  */
 import * as path from 'node:path';
 import {
@@ -71,7 +77,6 @@ import {
   RepositoryScopeWriterAdapter,
   SourceDispatcher,
   StaticTokenProvider,
-  TargetStateStore,
   ZipBundleExtractor,
 } from '@ai-primitives-hub/infra';
 import {
@@ -85,23 +90,27 @@ import {
   findProjectLockfile,
   finishRecordRun,
   formatOutput,
+  inferTargetName,
   loadInquirer,
   loadTargets,
   lockfilePathForTarget,
+  migrateDecision,
   Option,
   type OutputFormat,
   type PreparedRecordSelection,
   prepareOldFileOnly,
-  prepareRecordSelection,
+  prepareRecordDecision,
   readTargetsSafely,
+  type RecordDecision,
   recordOutputFields,
   recordPlannedInstall,
+  type RecordSelectionInput,
   RegistryError,
   renderMigration,
   renderRecordLine,
+  resolveCommandTarget,
   resolveEffectiveTarget,
-  resolveTarget,
-  resolveTargetName,
+  type TargetOverrides,
   tokensForRecordSource,
   writerEnv,
 } from '../framework';
@@ -209,8 +218,8 @@ export class UpdateCommand extends BaseUpdateCommand {
     details: `
       Usage: ai-primitives-hub update [options]
 
-      Reads the lockfile, checks each remote bundle against its upstream source,
-      and installs available upgrades.
+      Reads the install record, checks each remote bundle against its upstream
+      source, and installs available upgrades.
 
       Options:
         --lockfile <path>       Path to a lockfile
@@ -257,27 +266,31 @@ export class UpdateCommand extends BaseUpdateCommand {
     await detectUpdateContext(opts, ctx);
 
     try {
-      const targetName = await resolveTargetName(opts.target, 'update', ctx, () => loadTargets(ctx));
-      const configuredTarget = await resolveTarget(targetName, 'update', ctx, () => loadTargets(ctx));
-      const target = resolveEffectiveTarget(ctx, configuredTarget, opts);
+      // BR23.3: with zero or several targets and no --target, the record
+      // decides. Its level is chosen read-only first, so a run the record does
+      // not decide fails below before anything is migrated, written or fetched
+      // (NFR4.27).
+      const input = { command: 'update', lockfile: this.lockfile, scope: opts.scope };
+      const run: RecordUpdateBase = {
+        ctx, fmt, http, tokens, overrides: opts, dryRun: this.dryRun, interactive: this.interactive, noHubSync: this.noHubSync
+      };
+      const targetName = await inferTargetName(ctx, opts.target);
+      if (targetName === undefined) {
+        const decided = await runRecordUpdate(run, await prepareRecordWithoutTarget(ctx, input, this.dryRun));
+        if (decided !== undefined) {
+          return decided;
+        }
+      }
+
+      const target = await resolveCommandTarget(ctx, 'update', targetName, opts);
 
       // Select the record first: every selected file is loaded and checked
       // before anything is fetched or written (W5 step 1, NFR4.8). A real
       // update migrates the selected level first; a dry run never does (BR18.1).
-      const prepared = await prepareRecordSelection(ctx, { command: 'update', lockfile: this.lockfile, scope: opts.scope, write: this.dryRun !== true }, target);
-      if (prepared.selection.locations.length > 0) {
-        const rows = await prepared.service.listEntries(prepared.selection.locations);
-        if (rows.length > 0) {
-          if (!this.noHubSync) {
-            await syncActiveHub(ctx);
-          }
-          return await updateFromRecord({
-            ctx, fmt, http, tokens, prepared, target,
-            explicit: this.target !== undefined && this.target.length > 0 ? target : undefined,
-            dryRun: this.dryRun,
-            interactive: this.interactive
-          });
-        }
+      const decision = await prepareRecordDecision(ctx, input, { write: this.dryRun !== true, target });
+      const recorded = await runRecordUpdate(run, decision, this.target !== undefined && this.target.length > 0 ? target : undefined);
+      if (recorded !== undefined) {
+        return recorded;
       }
 
       const commitMode = target.commitMode ?? 'commit';
@@ -343,7 +356,8 @@ export class UpdateCommand extends BaseUpdateCommand {
 
 /**
  * Detect update context from the project environment (symmetric with install/uninstall).
- * Fills in `opts.target` when it can be inferred.
+ * Fills in `opts.lockfile` when it can be inferred; the target is inferred
+ * later (`inferTargetName`, BR23.2).
  * @param opts Update options (mutated in-place).
  * @param ctx CLI context.
  */
@@ -352,12 +366,6 @@ async function detectUpdateContext(opts: UpdateOptions, ctx: Context): Promise<v
     const found = await findProjectLockfile(ctx);
     if (found !== null) {
       opts.lockfile = found;
-    }
-  }
-  if (!opts.target || opts.target.length === 0) {
-    const targets = await readTargetsSafely(loadTargets(ctx));
-    if (targets.length === 1) {
-      opts.target = targets[0].name;
     }
   }
 }
@@ -376,6 +384,55 @@ const remoteBundleIds = (lock: Lockfile, bundleIds: readonly string[]): string[]
   const src = lock.sources[lock.bundles[bundleId].sourceId];
   return src !== undefined && isRemoteSource(src.type);
 });
+
+/**
+ * The record `update` acts on when no target is inferred (zero or several
+ * configured, no `--target`; BR23.3). The level is chosen read-only first
+ * (`--lockfile`, then `--scope`, then the default rule) and only its 3.0.0
+ * entries decide; bundles that only an older store lists do not. When they
+ * decide, a real run migrates the level before anything is fetched
+ * ({@link migrateDecision}, BR18.1); a dry run keeps the read-only selection.
+ * @param ctx CLI context.
+ * @param input Command name and the typed `--lockfile` / `--scope`.
+ * @param dryRun `true` for `--dry-run`.
+ * @returns The decision to update, or `undefined` when the record does not decide (the caller then needs a target).
+ * @throws {RegistryError} A `RECORD.*` error naming the file.
+ */
+async function prepareRecordWithoutTarget(
+  ctx: Context,
+  input: Omit<RecordSelectionInput, 'write'>,
+  dryRun: boolean
+): Promise<RecordDecision | undefined> {
+  const decision = await prepareRecordDecision(ctx, input);
+  return decision.rows.length === 0 ? undefined : migrateDecision(ctx, decision, { dryRun });
+}
+
+/** What every record-driven update run shares, whatever its target. */
+type RecordUpdateBase = Omit<RecordUpdateRun, 'prepared' | 'explicit'> & { noHubSync: boolean };
+
+/**
+ * Update from the record when its entries decide: sync the active hub unless
+ * `--no-hub-sync`, then {@link updateFromRecord} (W5). One path for the run
+ * with no inferred target (BR23.3) and the targeted one.
+ * @param run Context, clients, overrides and flags of the update.
+ * @param decision The selected record and its entries; none when the record does not decide.
+ * @param explicit The target named by `--target`; only it narrows the plan to one tool (BR6.1).
+ * @returns Exit code, or `undefined` when the selected record has no entry (the caller then uses the old store).
+ */
+async function runRecordUpdate(
+  run: RecordUpdateBase,
+  decision: RecordDecision | undefined,
+  explicit?: Target
+): Promise<number | undefined> {
+  if (decision === undefined || decision.rows.length === 0) {
+    return undefined;
+  }
+  const { noHubSync, ...base } = run;
+  if (!noHubSync) {
+    await syncActiveHub(base.ctx);
+  }
+  return updateFromRecord({ ...base, ...(explicit === undefined ? {} : { explicit }), prepared: decision.prepared });
+}
 
 /**
  * Build a `RegistrySource`-shaped object from a lockfile source entry,
@@ -695,7 +752,6 @@ async function applyUpdate(
   nextLock = upsertSource(nextLock, candidate.entry.sourceId, candidate.source);
   await writeLockfile(lockPath, nextLock, ctx.fs);
   await removeSupersededFiles(writer, target, previousFiles, entry.files);
-  await saveTargetState(ctx, target, lockKey, manifest.version);
 }
 
 /**
@@ -725,27 +781,6 @@ async function downloadCandidate(
   const isArtifactory = candidate.source.type === 'artifactory';
   const manifest = validateManifest(files, { expectedId: undefined, expectedVersion: isArtifactory ? candidate.installable.ref.bundleVersion : undefined });
   return { dl, files, manifest };
-}
-
-/**
- * Record a bundle's new version in the target's last-installed state.
- * @param ctx CLI context.
- * @param target Target the bundle was written to.
- * @param bundleId Bundle id.
- * @param version New version.
- */
-async function saveTargetState(ctx: Context, target: Target, bundleId: string, version: string): Promise<void> {
-  const stateStore = new TargetStateStore({ fs: ctx.fs, statePath: path.join(ctx.cwd(), '.ai-primitives-hub', 'target-state.json') });
-  const existingState = await stateStore.load(target.name);
-  const bundles = existingState?.lastInstalledBundles ?? [];
-  const idx = bundles.findIndex((b) => b.bundleId === bundleId);
-  const bundleState = { bundleId, version, installedAt: new Date().toISOString() };
-  if (idx === -1) {
-    bundles.push(bundleState);
-  } else {
-    bundles[idx] = bundleState;
-  }
-  await stateStore.save({ targetName: target.name, lastInstalledBundles: bundles, lastUsedAt: new Date().toISOString() });
 }
 
 // ---------------------------------------------------------------------------
@@ -782,10 +817,10 @@ interface RecordUpdateRun {
   http: HttpClient;
   tokens: TokenProvider;
   prepared: PreparedRecordSelection;
-  /** The resolved target; it writes the old-file-only bundles, as today (BR10.1). */
-  target: Target;
   /** The target named by `--target`; only it narrows the plan to one tool (BR6.1). */
   explicit?: Target;
+  /** `--scope` / `--commit-mode`, applied to the target inferred for old-file-only bundles (BR10.1). */
+  overrides: TargetOverrides;
   dryRun: boolean;
   interactive: boolean;
 }
@@ -939,7 +974,6 @@ async function applyRecordUpdate(
     changes.push(await record(sibling.tool, sibling.location, siblingTarget, false));
     synced.push(sibling.tool);
   }
-  await saveTargetState(ctx, item.target, item.bundleId, manifest.version);
   return { version: manifest.version, changes, synced, outOfDate };
 }
 
@@ -1078,12 +1112,15 @@ async function updateFromRecord(run: RecordUpdateRun): Promise<number> {
  * Update the bundles that are only in the selected level's old
  * `prompt-registry.*` file with today's code, on that file, writing nothing
  * about them into the new record (BR10.1; W5 step 6).
- * @param run Update inputs; `run.target` writes the old-file bundles, as today.
+ * They go to the `--target` target, else the only configured target, with
+ * `--scope` / `--commit-mode` applied, as install does (BR23.2); otherwise
+ * they are reported as per-bundle failures with the missing-target message.
+ * @param run Update inputs.
  * @returns What was checked and updated, or `undefined` when there is no old-file-only bundle.
  */
 async function updateOldFileOnly(run: RecordUpdateRun): Promise<OldFileUpdate | undefined> {
   const { ctx, http, tokens } = run;
-  const old = await prepareOldFileOnly(ctx, run.prepared, { command: 'update', target: run.target });
+  const old = await prepareOldFileOnly(ctx, run.prepared, { command: 'update', target: run.explicit, overrides: run.overrides });
   if (old === undefined) {
     return undefined;
   }

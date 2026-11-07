@@ -85,21 +85,19 @@ import {
   RepositoryScopeWriterAdapter,
   SourceDispatcher,
   StaticTokenProvider,
-  TargetStateStore,
   ZipBundleExtractor,
 } from '@ai-primitives-hub/infra';
 import {
   Command,
-  type CommandDefinition,
   configuredSources,
   type Context,
   createHubManager,
   createLayoutLoader,
-  defineCommand,
   failWith,
   findProjectLockfile,
   finishRecordRun,
   formatOutput,
+  inferTargetName,
   loadInquirer,
   loadTargets,
   lockfilePathForTarget,
@@ -119,9 +117,8 @@ import {
   renderRecordLine,
   type RepositoryInstallToRecord,
   requireActiveHubOrFail,
+  resolveCommandTarget,
   resolveEffectiveTarget,
-  resolveTarget,
-  resolveTargetName,
   toCommandRecordError,
   tokensForRecordSource,
   validateInputs,
@@ -438,7 +435,7 @@ export class InstallCommand extends BaseInstallCommand {
 
       Examples:
         ai-primitives-hub install --from <path> --target my-vscode
-        ai-primitives-hub install --lockfile prompt-registry.lock.json --target my-vscode
+        ai-primitives-hub install --lockfile ai-primitives-hub.lock.json --target my-vscode
         ai-primitives-hub install --source amadeus-hub --interactive --target my-vscode
     `
   });
@@ -491,7 +488,7 @@ export class InstallCommand extends BaseInstallCommand {
         let explicit: Target | undefined;
         if (typedTarget) {
           checkAllowTarget(opts.target as string, opts);
-          explicit = resolveEffectiveTarget(ctx, await resolveTarget(opts.target as string, 'install', ctx, () => loadTargets(ctx)), opts);
+          explicit = await resolveCommandTarget(ctx, 'install', opts.target, opts);
         }
         return await performRecordReplay({ ctx, fmt, opts, prepared: recordReplay, explicit });
       }
@@ -509,23 +506,26 @@ export class InstallCommand extends BaseInstallCommand {
         message: 'install: provide either <bundle-id> (imperative), --lockfile <path> (declarative), --from <path> (local directory), or --source <hub-id> (list bundles)',
         hint: 'Examples:\n'
           + '  ai-primitives-hub install --from <path> --target my-vscode\n'
-          + '  ai-primitives-hub install --lockfile prompt-registry.lock.json\n'
+          + '  ai-primitives-hub install --lockfile ai-primitives-hub.lock.json\n'
           + '  ai-primitives-hub install --source amadeus-hub --target my-vscode'
       }));
     }
 
     try {
-      const targetName = await resolveTargetName(opts.target, 'install', ctx, () => loadTargets(ctx));
-      checkAllowTarget(targetName, opts);
-      const configuredTarget = await resolveTarget(targetName, 'install', ctx, () => loadTargets(ctx));
-      const target = resolveEffectiveTarget(ctx, configuredTarget, opts);
+      const targetName = await inferTargetName(ctx, opts.target);
+      if (targetName !== undefined) {
+        checkAllowTarget(targetName, opts);
+      }
+      const target = await resolveCommandTarget(ctx, 'install', targetName, opts);
+      // The modes report the target they ran with, typed or inferred.
+      const runOpts: InstallOptions = { ...opts, target: targetName };
 
-      const mode = determineInstallMode(opts);
+      const mode = determineInstallMode(runOpts);
       if (mode === undefined) {
-        return await performRemoteInstall(opts, target, ctx, fmt);
+        return await performRemoteInstall(runOpts, target, ctx, fmt);
       }
 
-      return await executeInstallMode(mode, opts, target, ctx, fmt);
+      return await executeInstallMode(mode, runOpts, target, ctx, fmt);
     } catch (err) {
       if (err instanceof RegistryError) {
         return failWith(ctx, fmt, 'install', err);
@@ -589,8 +589,9 @@ function refuseDryRunReplay(opts: InstallOptions): void {
 
 /**
  * Detect install context from the project environment.
- * Fills in `opts.lockfile`, `opts.source`, `opts.interactive`, and `opts.target`
- * when they can be inferred without user input. `--lockfile` on a new record
+ * Fills in `opts.lockfile`, `opts.source` and `opts.interactive` when they
+ * can be inferred without user input; the target is inferred later
+ * (`inferTargetName`, BR23.2). `--lockfile` on a new record
  * file, or a bare `install` that finds a 3.0.0 record with entries or an old
  * `prompt-registry` file at the git root, selects that record for replay
  * (W6 step 1; BR6.2, BR18.1; the old file is migrated first): every selected
@@ -636,15 +637,6 @@ async function detectInstallContext(opts: InstallOptions, ctx: Context): Promise
       await autoDetectHubSource(opts, ctx, userPaths);
     } catch {
       // Ignore errors; proceed without auto-detected hub
-    }
-  }
-
-  if (!opts.target || opts.target.length === 0) {
-    const targets = await readTargetsSafely(
-      loadTargets(ctx)
-    );
-    if (targets.length === 1) {
-      opts.target = targets[0].name;
     }
   }
   return undefined;
@@ -1148,8 +1140,6 @@ async function performLocalInstall(
       return legacyLockPath;
     });
 
-    await updateTargetState(ctx, effectiveTarget.name, manifest.id, manifest.version);
-
     formatOutput({
       ctx,
       command: 'install',
@@ -1238,10 +1228,6 @@ async function performLockfileInstall(
     verbose: opts.verbose ?? false,
     sourceAwareDependencyCache
   });
-
-  if (replayed.length > 0) {
-    await updateTargetStateFromLockfile(ctx, effectiveTarget.name, lock, replayed);
-  }
 
   const status = failures.length === 0 ? 'ok' : 'warning';
   formatOutput({
@@ -1417,7 +1403,6 @@ async function performRecordReplay(run: RecordReplayRun): Promise<number> {
       changes.push(await recordPlannedInstall(
         service, { ...item, sourceId: entry.sourceId, source, sourceType: entry.sourceType }, target, ctx, manifest.version, written, false
       ));
-      await updateTargetState(ctx, target.name, bundleId, manifest.version);
       data.replayed.push({ bundleId, tool, version: manifest.version, target: target.name });
     } catch (cause) {
       if (isRecordError(cause)) {
@@ -1458,7 +1443,8 @@ async function performRecordReplay(run: RecordReplayRun): Promise<number> {
  * Replay the bundles that are only in the selected level's old
  * `prompt-registry.*` file with today's code, on that file, writing nothing
  * about them into the new record (BR10.1; W6 step 4). They go to the
- * `--target` target, else the only configured target, else the last used one, as today.
+ * `--target` target, else the only configured target; otherwise each is
+ * reported as a replay failure with the missing-target message (BR23.2).
  * @param run Replay inputs.
  * @param fetch HTTP client, token provider and source-aware dependency cache.
  * @param fetch.http HTTP client.
@@ -1491,9 +1477,6 @@ async function replayOldFileOnly(
     verbose: opts.verbose ?? false,
     sourceAwareDependencyCache: fetch.cache
   });
-  if (replayed.length > 0) {
-    await updateTargetStateFromLockfile(ctx, target.name, lock, replayed);
-  }
   return { lockfile: lockPath, target: target.name, replayPlanned: bundleIds.length, replayed, failures };
 }
 
@@ -1702,68 +1685,6 @@ async function performRemoteInstall(
 }
 
 /**
- * Update target state with installed bundle.
- * @param ctx CLI context.
- * @param targetName Target name.
- * @param bundleId Bundle ID.
- * @param version Bundle version.
- */
-async function updateTargetState(ctx: Context, targetName: string, bundleId: string, version: string): Promise<void> {
-  const stateStore = new TargetStateStore({
-    fs: ctx.fs,
-    statePath: path.join(ctx.cwd(), '.ai-primitives-hub', 'target-state.json')
-  });
-  const existingState = await stateStore.load(targetName);
-  const newBundles = existingState?.lastInstalledBundles ?? [];
-  const bundleIndex = newBundles.findIndex((b) => b.bundleId === bundleId);
-  const bundleState = { bundleId, version, installedAt: new Date().toISOString() };
-  if (bundleIndex === -1) {
-    newBundles.push(bundleState);
-  } else {
-    newBundles[bundleIndex] = bundleState;
-  }
-  await stateStore.save({
-    targetName,
-    lastInstalledBundles: newBundles,
-    lastUsedAt: new Date().toISOString()
-  });
-}
-
-/**
- * Update target state from lockfile entries.
- * @param ctx CLI context.
- * @param targetName Target name.
- * @param lock Lockfile.
- * @param replayed Replayed bundle IDs.
- */
-async function updateTargetStateFromLockfile(ctx: Context, targetName: string, lock: Lockfile, replayed: string[]): Promise<void> {
-  const stateStore = new TargetStateStore({
-    fs: ctx.fs,
-    statePath: path.join(ctx.cwd(), '.ai-primitives-hub', 'target-state.json')
-  });
-  const existingState = await stateStore.load(targetName);
-  const newBundles = existingState?.lastInstalledBundles ?? [];
-  for (const bundleId of replayed) {
-    const entry = lock.bundles[bundleId];
-    if (entry === undefined) {
-      continue;
-    }
-    const bundleIndex = newBundles.findIndex((b) => b.bundleId === bundleId);
-    const bundleState = { bundleId, version: entry.version, installedAt: entry.installedAt };
-    if (bundleIndex === -1) {
-      newBundles.push(bundleState);
-    } else {
-      newBundles[bundleIndex] = bundleState;
-    }
-  }
-  await stateStore.save({
-    targetName,
-    lastInstalledBundles: newBundles,
-    lastUsedAt: new Date().toISOString()
-  });
-}
-
-/**
  * Install a single bundle given an explicit source configuration.
  * Shared by `install --interactive` and `index search --install`.
  * @param bundleId Bundle ID to install.
@@ -1793,55 +1714,6 @@ export async function installBundleWithSource(
   };
   return performRemoteInstall(opts, target, ctx, fmt);
 }
-
-/**
- * Build the `install` command (factory function for backward compatibility).
- * @param opts - Command options.
- * @returns CommandDefinition wired to the framework adapter.
- */
-export const createInstallCommand = (
-  opts: InstallOptions = {}
-): CommandDefinition =>
-  defineCommand({
-    path: ['install'],
-    description: 'Install bundles to a configured target.',
-    category: 'Install & Manage',
-    run: async ({ ctx }: { ctx: Context }): Promise<number> => {
-      const fmt = opts.output ?? 'text';
-      const { bundle: noBundle, lockfile: noLockfile } = validateInputs(opts, { flags: ['bundle', 'lockfile'] });
-      if (noBundle && noLockfile) {
-        return failWith(ctx, fmt, 'install', new RegistryError({
-          code: 'USAGE.MISSING_FLAG',
-          message: 'install: provide either <bundle-id> (imperative) or --lockfile <path> (declarative)',
-          hint: 'Examples:\n'
-            + '  ai-primitives-hub install <bundle-id>\n'
-            + '  ai-primitives-hub install --lockfile prompt-registry.lock.json'
-        }));
-      }
-
-      try {
-        const targetName = await resolveTargetName(opts.target, 'install', ctx, () => loadTargets(ctx));
-        checkAllowTarget(targetName, opts);
-        const configuredTarget = await resolveTarget(targetName, 'install', ctx, () => loadTargets(ctx));
-        const target = resolveEffectiveTarget(ctx, configuredTarget, opts);
-
-        if (opts.from !== undefined && opts.from.length > 0) {
-          return await performLocalInstall(opts, target, ctx, fmt);
-        }
-
-        if (opts.lockfile !== undefined && opts.lockfile.length > 0) {
-          return await performLockfileInstall(opts, target, ctx, fmt);
-        }
-
-        return await performRemoteInstall(opts, target, ctx, fmt);
-      } catch (err) {
-        if (err instanceof RegistryError) {
-          return failWith(ctx, fmt, 'install', err);
-        }
-        throw err;
-      }
-    }
-  });
 
 /**
  * Replay lockfile entries for installation.

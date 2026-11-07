@@ -13,9 +13,11 @@
  * `.ai-primitives-hub/`).
  * @module framework/error
  */
+import * as path from 'node:path';
 import {
   isRegistryError,
   RegistryError,
+  type Target,
 } from '@ai-primitives-hub/core';
 import type {
   Context,
@@ -26,6 +28,11 @@ import {
 import type {
   OutputFormat,
 } from './output';
+import {
+  loadTargets,
+  resolveEffectiveTarget,
+  type TargetOverrides,
+} from './target';
 
 export type {
   RegistryErrorNamespace,
@@ -154,13 +161,56 @@ export const throwTargetNotFoundError = (
 };
 
 /**
- * Resolve target name from options or fallback to last used target.
+ * Old per-project "last used target" file. The CLI no longer reads or
+ * writes it (BR23.1); its presence only adds a line to the missing-target
+ * hint (NFR5.5). It is never opened, parsed or deleted (NFR4.28).
+ */
+const OLD_TARGET_STATE_FILE = '.ai-primitives-hub/target-state.json';
+
+/** Hint line shown while an old `target-state.json` is still on disk. */
+const OLD_TARGET_STATE_HINT = `The last used target (${OLD_TARGET_STATE_FILE}) is no longer used; pass --target.`;
+
+/**
+ * Whether a `--target` value was typed (present and not empty).
+ * @param targetName Target name from options.
+ * @returns `true` when a name was typed.
+ */
+const isTyped = (targetName: string | undefined): targetName is string => targetName !== undefined && targetName.length > 0;
+
+/**
+ * The one configured target a command uses without `--target` (BR23.2).
+ * @param targets Configured targets.
+ * @returns Its name when exactly one is configured, else `undefined`.
+ */
+const onlyTargetName = (targets: readonly { name: string }[]): string | undefined =>
+  targets.length === 1 ? targets[0].name : undefined;
+
+/**
+ * The target name a command runs with, without failing: `--target` when
+ * typed, else the only configured target (BR23.2). `undefined` means none
+ * could be inferred (zero or several configured), so `update` and
+ * `uninstall <bundle-id>` let the record decide (BR23.3) and the other
+ * commands fail through {@link resolveCommandTarget}. An unreadable target
+ * list counts as empty.
+ * @param ctx CLI context.
+ * @param typed `--target` value, when given.
+ * @returns The typed or inferred name, or `undefined`.
+ */
+export const inferTargetName = async (ctx: Context, typed: string | undefined): Promise<string | undefined> =>
+  isTyped(typed) ? typed : onlyTargetName(await readTargetsSafely(loadTargets(ctx)));
+
+/**
+ * Resolve the target name: `--target` when given, else the only configured
+ * target (BR23.2). With none or several configured, throws
+ * `USAGE.MISSING_FLAG` listing them (or saying how to add one); when the
+ * folder still holds an old `.ai-primitives-hub/target-state.json`, the hint
+ * says it is no longer used. Throws before anything is written.
  * @param targetName Target name from options (may be undefined or empty).
  * @param commandName Command name for error message (e.g., 'install', 'uninstall').
  * @param ctx CLI context.
- * @param readTargetsFn Function to read configured targets.
+ * @param readTargetsFn Function to read configured targets (the full `loadTargets` list).
  * @returns Resolved target name.
- * @throws {RegistryError} When target is not provided and no last used target exists.
+ * @throws {RegistryError} When no target is given and not exactly one is configured.
  */
 export const resolveTargetName = async <T extends { name: string }>(
   targetName: string | undefined,
@@ -168,26 +218,21 @@ export const resolveTargetName = async <T extends { name: string }>(
   ctx: Context,
   readTargetsFn: () => Promise<T[]>
 ): Promise<string> => {
-  if (targetName === undefined || targetName.length === 0) {
-    const { TargetStateStore } = await import('@ai-primitives-hub/infra');
-    const path = await import('node:path');
-    const stateStore = new TargetStateStore({
-      fs: ctx.fs,
-      statePath: path.default.join(ctx.cwd(), '.ai-primitives-hub', 'target-state.json')
-    });
-    const lastUsed = await stateStore.getLastUsedTarget();
-    if (lastUsed !== null) {
-      return lastUsed;
-    }
-    const configuredTargets = await readTargetsSafely(readTargetsFn());
-    const hint = generateTargetHint(configuredTargets);
-    throw new RegistryError({
-      code: 'USAGE.MISSING_FLAG',
-      message: `${commandName}: --target <name> is required`,
-      hint
-    });
+  if (isTyped(targetName)) {
+    return targetName;
   }
-  return targetName;
+  const configuredTargets = await readTargetsSafely(readTargetsFn());
+  const only = onlyTargetName(configuredTargets);
+  if (only !== undefined) {
+    return only;
+  }
+  const hasOldTargetState = await ctx.fs.exists(path.join(ctx.cwd(), OLD_TARGET_STATE_FILE)).catch(() => false);
+  const hint = generateTargetHint(configuredTargets);
+  throw new RegistryError({
+    code: 'USAGE.MISSING_FLAG',
+    message: `${commandName}: --target <name> is required`,
+    hint: hasOldTargetState ? `${hint}\n  ${OLD_TARGET_STATE_HINT}` : hint
+  });
 };
 
 /**
@@ -237,6 +282,28 @@ export const resolveTarget = async <T extends { name: string }>(
     throwTargetNotFoundError(commandName, targetName, targets);
   }
   return target!;
+};
+
+/**
+ * The effective target a command runs with: the typed or only configured
+ * target name ({@link resolveTargetName}), looked up in the configured
+ * targets ({@link resolveTarget}) and made effective with the command's
+ * `--scope` / `--commit-mode` overrides. Throws before anything is written.
+ * @param ctx CLI context.
+ * @param command Command name for the error messages (e.g. 'install', 'uninstall').
+ * @param typed `--target` value or an already inferred name, when there is one.
+ * @param overrides `--scope` / `--commit-mode` given to the command.
+ * @returns The effective target.
+ * @throws {RegistryError} `USAGE.MISSING_FLAG` when no target is given and not exactly one is configured, or the named one is not configured.
+ */
+export const resolveCommandTarget = async (
+  ctx: Context,
+  command: string,
+  typed: string | undefined,
+  overrides?: TargetOverrides
+): Promise<Target> => {
+  const name = await resolveTargetName(typed, command, ctx, () => loadTargets(ctx));
+  return resolveEffectiveTarget(ctx, await resolveTarget(name, command, ctx, () => loadTargets(ctx)), overrides);
 };
 
 /**

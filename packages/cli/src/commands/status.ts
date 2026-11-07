@@ -5,9 +5,11 @@
  * a concise dashboard without any network calls. Useful for verifying
  * that a project is correctly configured before activating profiles.
  *
- * The record is selected with no level given (W4, BR6.2): the repository
- * record when one (or an old `prompt-registry.*` file) is at the git root,
- * else the user lockfile. JSON carries `level`, `records` and one
+ * The record (format 3.0.0, keyed by bundle and tool) exists at repository
+ * and at user level. It is selected with no level given (W4, BR6.2): the
+ * repository record when one (or an old `prompt-registry.*` file) is at the
+ * git root, else the shared user record (`ai-primitives-hub.user.lock.json`).
+ * JSON carries `level`, `records` and one
  * `entries` row per (bundle, tool) (BR9.2); bundles only in an old file are
  * listed under tool `unknown` with that file as their record (BR10.1).
  * @module commands/status
