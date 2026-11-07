@@ -25,12 +25,18 @@ import {
   type Lockfile,
   type LockfileBundleEntry,
   type LockfileSourceEntry,
+  type MigrationReport,
+  planRecordEntries,
   readLockfile,
+  type RecordInstallResult,
   removeSupersededFiles,
   resolveInstallSource,
   resolveUserConfigPaths,
   type SkippedBundleContent,
   type TargetWriter,
+  toLockfileBundleEntry,
+  toLockfileSourceEntry,
+  toRecordSource,
   TransformerRegistry,
   upsertBundleEntry,
   upsertSource,
@@ -45,11 +51,14 @@ import type {
   GitHubSourceAuthCategory,
   HttpClient,
   HubSourceSpec,
+  RecordLevel,
   RegistrySource,
+  RepositoryExclusion,
   Target,
   TokenProvider,
 } from '@ai-primitives-hub/core';
 import {
+  isRecordError,
   parseBundleSpec,
   validateManifest,
 } from '@ai-primitives-hub/core';
@@ -62,7 +71,6 @@ import {
   AwesomeCopilotBundleResolver,
   createGitHubSourceAuthRuntime,
   defaultTokenProvider,
-  FileSystemLayoutConfigLoader,
   GitHubApiClient,
   GitHubBundleResolver,
   type GitHubSourceAuthRuntime,
@@ -75,35 +83,46 @@ import {
   type RepositoryCommitMode,
   RepositoryScopeWriter,
   RepositoryScopeWriterAdapter,
-  resolveUserConfigDir,
   SourceDispatcher,
   StaticTokenProvider,
-  TargetStateStore,
   ZipBundleExtractor,
 } from '@ai-primitives-hub/infra';
 import {
   Command,
+  configuredSources,
+  type Context,
   createHubManager,
+  createLayoutLoader,
   failWith,
   findProjectLockfile,
+  finishRecordRun,
+  formatOutput,
+  inferTargetName,
   loadInquirer,
   loadTargets,
   lockfilePathForTarget,
   Option,
-  requireActiveHubOrFail,
-} from '../framework';
-import {
-  type CommandDefinition,
-  type Context,
-  defineCommand,
-  formatOutput,
   type OutputFormat,
+  type PreparedRecordSelection,
+  type PreparedRepositoryRecord,
+  prepareOldFileOnly,
+  prepareRecordForTarget,
+  prepareRecordSelection,
   readTargetsSafely,
+  recordOutputFields,
+  recordPlannedInstall,
+  recordRepositoryInstall,
   RegistryError,
+  renderMigration,
+  renderRecordLine,
+  type RepositoryInstallToRecord,
+  requireActiveHubOrFail,
+  resolveCommandTarget,
   resolveEffectiveTarget,
-  resolveTarget,
-  resolveTargetName,
+  toCommandRecordError,
+  tokensForRecordSource,
   validateInputs,
+  writerEnv,
 } from '../framework';
 
 /**
@@ -358,6 +377,21 @@ const skippedWarnings = (skipped: readonly SkippedBundleContent[]): string[] | u
   skipped.length === 0 ? undefined : skipped.map((s) => `skipped ${s.path}: ${s.reason}`);
 
 /**
+ * All install warnings: skipped content first, then install-record warnings
+ * (for example a superseded path that was not deleted).
+ * @param skipped Skipped content.
+ * @param recordWarnings Warnings from the repository install record.
+ * @returns The combined warnings, or `undefined` when there are none.
+ */
+const installWarnings = (
+  skipped: readonly SkippedBundleContent[],
+  recordWarnings: readonly string[]
+): string[] | undefined => {
+  const all = [...(skippedWarnings(skipped) ?? []), ...recordWarnings];
+  return all.length === 0 ? undefined : all;
+};
+
+/**
  * Command context for install/uninstall commands.
  */
 interface CommandContext {
@@ -401,7 +435,7 @@ export class InstallCommand extends BaseInstallCommand {
 
       Examples:
         ai-primitives-hub install --from <path> --target my-vscode
-        ai-primitives-hub install --lockfile prompt-registry.lock.json --target my-vscode
+        ai-primitives-hub install --lockfile ai-primitives-hub.lock.json --target my-vscode
         ai-primitives-hub install --source amadeus-hub --interactive --target my-vscode
     `
   });
@@ -444,7 +478,26 @@ export class InstallCommand extends BaseInstallCommand {
       skipUnsupported: this.skipUnsupported
     };
 
-    await detectInstallContext(opts, ctx);
+    const typedTarget = opts.target !== undefined && opts.target.length > 0;
+    let recordReplay: PreparedRecordSelection | undefined;
+    try {
+      recordReplay = await detectInstallContext(opts, ctx);
+      if (recordReplay !== undefined) {
+        // A 3.0.0 record maps each tool to its own target (BR6.4); only a
+        // typed --target narrows the replay to that target.
+        let explicit: Target | undefined;
+        if (typedTarget) {
+          checkAllowTarget(opts.target as string, opts);
+          explicit = await resolveCommandTarget(ctx, 'install', opts.target, opts);
+        }
+        return await performRecordReplay({ ctx, fmt, opts, prepared: recordReplay, explicit });
+      }
+    } catch (err) {
+      if (err instanceof RegistryError) {
+        return failWith(ctx, fmt, 'install', err);
+      }
+      throw err;
+    }
 
     const { bundle: noBundle, lockfile: noLockfile } = validateInputs(opts, { flags: ['bundle', 'lockfile'] });
     if (noBundle && noLockfile && !opts.from && !opts.source) {
@@ -453,23 +506,26 @@ export class InstallCommand extends BaseInstallCommand {
         message: 'install: provide either <bundle-id> (imperative), --lockfile <path> (declarative), --from <path> (local directory), or --source <hub-id> (list bundles)',
         hint: 'Examples:\n'
           + '  ai-primitives-hub install --from <path> --target my-vscode\n'
-          + '  ai-primitives-hub install --lockfile prompt-registry.lock.json\n'
+          + '  ai-primitives-hub install --lockfile ai-primitives-hub.lock.json\n'
           + '  ai-primitives-hub install --source amadeus-hub --target my-vscode'
       }));
     }
 
     try {
-      const targetName = await resolveTargetName(opts.target, 'install', ctx, () => loadTargets(ctx));
-      checkAllowTarget(targetName, opts);
-      const configuredTarget = await resolveTarget(targetName, 'install', ctx, () => loadTargets(ctx));
-      const target = resolveEffectiveTarget(ctx, configuredTarget, opts);
+      const targetName = await inferTargetName(ctx, opts.target);
+      if (targetName !== undefined) {
+        checkAllowTarget(targetName, opts);
+      }
+      const target = await resolveCommandTarget(ctx, 'install', targetName, opts);
+      // The modes report the target they ran with, typed or inferred.
+      const runOpts: InstallOptions = { ...opts, target: targetName };
 
-      const mode = determineInstallMode(opts);
+      const mode = determineInstallMode(runOpts);
       if (mode === undefined) {
-        return await performRemoteInstall(opts, target, ctx, fmt);
+        return await performRemoteInstall(runOpts, target, ctx, fmt);
       }
 
-      return await executeInstallMode(mode, opts, target, ctx, fmt);
+      return await executeInstallMode(mode, runOpts, target, ctx, fmt);
     } catch (err) {
       if (err instanceof RegistryError) {
         return failWith(ctx, fmt, 'install', err);
@@ -516,20 +572,60 @@ async function autoDetectHubSource(opts: InstallOptions, ctx: Context, userPaths
 }
 
 /**
+ * Refuse `--dry-run` for a record replay: the replay migrates older files and
+ * writes the recorded bundles, and a dry run must write nothing.
+ * @param opts Install options.
+ * @throws {RegistryError} `USAGE.INVALID_FLAG` when `--dry-run` is set; nothing was written.
+ */
+function refuseDryRunReplay(opts: InstallOptions): void {
+  if (opts.dryRun === true) {
+    throw new RegistryError({
+      code: 'USAGE.INVALID_FLAG',
+      message: 'install: --dry-run cannot be used to replay an install record; a replay migrates older records and writes every recorded bundle',
+      hint: 'Run `status` to see what is recorded, or install one bundle with install <bundle-id> --dry-run.'
+    });
+  }
+}
+
+/**
  * Detect install context from the project environment.
- * Fills in `opts.lockfile`, `opts.source`, `opts.interactive`, and `opts.target`
- * when they can be inferred without user input.
+ * Fills in `opts.lockfile`, `opts.source` and `opts.interactive` when they
+ * can be inferred without user input; the target is inferred later
+ * (`inferTargetName`, BR23.2). `--lockfile` on a new record
+ * file, or a bare `install` that finds a 3.0.0 record with entries or an old
+ * `prompt-registry` file at the git root, selects that record for replay
+ * (W6 step 1; BR6.2, BR18.1; the old file is migrated first): every selected
+ * file is loaded and checked here, before anything is written (NFR4.8).
  * @param opts Install options (mutated in-place).
  * @param ctx CLI context.
+ * @returns The selected 3.0.0 record to replay, or `undefined` for today's modes.
+ * @throws {RegistryError} A `RECORD.*` error naming the file; nothing was written.
  */
-async function detectInstallContext(opts: InstallOptions, ctx: Context): Promise<void> {
+async function detectInstallContext(opts: InstallOptions, ctx: Context): Promise<PreparedRecordSelection | undefined> {
   const { bundle: noBundle, lockfile: noLockfile } = validateInputs(opts, { flags: ['bundle', 'lockfile'] });
   const noExplicitSource = !opts.source || opts.source.length === 0;
   const noMode = noBundle && noLockfile && !opts.from && noExplicitSource;
 
   const userPaths = resolveUserConfigPaths(ctx.env);
 
+  if (!noLockfile && noBundle && !opts.from) {
+    const prepared = await prepareRecordSelection(ctx, { command: 'install', lockfile: opts.lockfile });
+    if (prepared.selection.locations.length > 0) {
+      // The replay changes the record: migrate its level first (BR18.1).
+      refuseDryRunReplay(opts);
+      return prepareRecordSelection(ctx, { command: 'install', lockfile: opts.lockfile, write: true });
+    }
+  }
+
   if (noMode && !opts.interactive) {
+    const prepared = await prepareRecordSelection(ctx, { command: 'install', scope: opts.scope });
+    const { selection } = prepared;
+    // An old file at the git root is migrated first, then the record is replayed (BR18.1).
+    const migratesOldFile = selection.level === 'repository' && selection.oldLockfile !== undefined;
+    if (migratesOldFile || (await prepared.service.listEntries(selection.locations)).length > 0) {
+      refuseDryRunReplay(opts);
+      return prepareRecordSelection(ctx, { command: 'install', scope: opts.scope, write: true });
+    }
     const found = await findProjectLockfile(ctx);
     if (found !== null) {
       opts.lockfile = found;
@@ -543,15 +639,7 @@ async function detectInstallContext(opts: InstallOptions, ctx: Context): Promise
       // Ignore errors; proceed without auto-detected hub
     }
   }
-
-  if (!opts.target || opts.target.length === 0) {
-    const targets = await readTargetsSafely(
-      loadTargets(ctx)
-    );
-    if (targets.length === 1) {
-      opts.target = targets[0].name;
-    }
-  }
+  return undefined;
 }
 
 /**
@@ -658,25 +746,45 @@ async function lookupHubSource(
 }
 
 /**
+ * Persist an install after the writer ran: in the repository install record
+ * when one was prepared (W1 steps 6–13), otherwise through the old lockfile.
+ * @param prepared The prepared repository record, or `undefined` for the old lockfile.
+ * @param record What the install record gets.
+ * @param legacy Writes the old lockfile entry and returns the lockfile path.
+ * @returns The file updated and the install record warnings.
+ */
+const persistInstall = async (
+  prepared: PreparedRepositoryRecord | undefined,
+  record: RepositoryInstallToRecord,
+  legacy: () => Promise<string>
+): Promise<{ lockPath: string; warnings: string[] }> => {
+  if (prepared === undefined) {
+    return { lockPath: await legacy(), warnings: [] };
+  }
+  const recorded = await recordRepositoryInstall(prepared, record);
+  return { lockPath: recorded.lockfile, warnings: recorded.warnings };
+};
+
+/**
  * Create a writer factory that routes to the appropriate
  * writer based on target scope.
  * - user scope → FileTreeTargetWriter
  * - repository scope → RepositoryScopeWriter
  * @param ctx CLI context.
  * @param opts Install options.
+ * @param exclusion Where a `local-only` repository install lists its files;
+ * the prepared record's exclusion, so they share the record's `info/exclude`.
+ * Defaults to the writer's `<workspace>/.git/info/exclude`.
  * @returns Writer factory function.
  */
 export const createWriterFactory = (
   ctx: Context,
-  opts: InstallOptions
+  opts: InstallOptions,
+  exclusion?: RepositoryExclusion
 ): (target: Target) => TargetWriter => {
   // Create transformer registry and hierarchical layout loader once per command.
   const transformerRegistry = TransformerRegistry.withBuiltIns();
-  const layoutLoader = new FileSystemLayoutConfigLoader({
-    cwd: ctx.cwd(),
-    fs: ctx.fs,
-    userConfigDir: resolveUserConfigDir(ctx.env)
-  });
+  const layoutLoader = createLayoutLoader(ctx);
 
   return (target: Target): TargetWriter => {
     const effectiveTarget = resolveEffectiveTarget(ctx, target, opts);
@@ -692,14 +800,15 @@ export const createWriterFactory = (
       const writer = new RepositoryScopeWriter({
         fs: ctx.fs,
         workspaceRoot,
-        commitMode
+        commitMode,
+        exclusion
       });
       return new RepositoryScopeWriterAdapter(writer);
     }
     const transformer = transformerRegistry.getTransformer(effectiveTarget.type);
     return new FileTreeTargetWriter({
       fs: ctx.fs,
-      env: ctx.env,
+      env: writerEnv(ctx.env, scope),
       transformer,
       layoutLoader
     });
@@ -991,37 +1100,45 @@ async function performLocalInstall(
       });
       return 0;
     }
-    const writerFactory = createWriterFactory(ctx, opts);
+    // Repository scope: both record files are loaded and checked before the
+    // writer runs, so a RECORD.* error stops here with nothing written (BR3.5).
+    // User scope: the shared user record is checked the same way, and a
+    // target folder outside home is refused (BR14.3).
+    const prepared = await prepareRecordForTarget(ctx, effectiveTarget);
+    const writerFactory = createWriterFactory(ctx, opts, prepared?.exclusion);
     const writer = writerFactory(effectiveTarget);
     const { installableFiles: targetFiles, result, skipped } = await writeBundleForInstall(
       writer, effectiveTarget, files, manifest, { skipUnsupported: opts.skipUnsupported === true }
     );
 
-    const scope = effectiveTarget.scope;
-    const commitMode = effectiveTarget.commitMode ?? 'commit';
-    const lockPath = lockfilePathForTarget(ctx, effectiveTarget);
-    const existing = await readLockfile(lockPath, ctx.fs) ?? emptyLockfile('ai-primitives-hub-cli');
     const localSourceId = `local-${path.basename(opts.from as string)}`;
-    const entry: LockfileBundleEntry = {
+    const localSourceUrl = path.resolve(ctx.cwd(), opts.from as string);
+    const { lockPath, warnings } = await persistInstall(prepared, {
+      bundleId: manifest.id,
       version: manifest.version,
-      sourceId: localSourceId,
-      sourceType: 'local',
-      installedAt: new Date().toISOString(),
-      files: checksumFiles(targetFiles, result.writtenBundlePaths ?? targetFiles.keys(), result.installedPaths)
-    };
-    if (scope === 'repository') {
-      entry.commitMode = commitMode;
-    }
-    const previousFiles = existing.bundles[manifest.id]?.files;
-    let nextLock = upsertBundleEntry(existing, manifest.id, entry);
-    nextLock = upsertSource(nextLock, localSourceId, {
-      type: 'local',
-      url: path.resolve(ctx.cwd(), opts.from as string)
+      tool: effectiveTarget.type,
+      source: { sourceId: localSourceId, type: 'local', url: localSourceUrl },
+      writtenPaths: result.written
+    }, async () => {
+      const legacyLockPath = lockfilePathForTarget(ctx, effectiveTarget);
+      const existing = await readLockfile(legacyLockPath, ctx.fs) ?? emptyLockfile('ai-primitives-hub-cli');
+      const entry: LockfileBundleEntry = {
+        version: manifest.version,
+        sourceId: localSourceId,
+        sourceType: 'local',
+        installedAt: new Date().toISOString(),
+        files: checksumFiles(targetFiles, result.writtenBundlePaths ?? targetFiles.keys(), result.installedPaths)
+      };
+      const previousFiles = existing.bundles[manifest.id]?.files;
+      let nextLock = upsertBundleEntry(existing, manifest.id, entry);
+      nextLock = upsertSource(nextLock, localSourceId, {
+        type: 'local',
+        url: localSourceUrl
+      });
+      await writeLockfile(legacyLockPath, nextLock, ctx.fs);
+      await removeSupersededFiles(writer, effectiveTarget, previousFiles, entry.files);
+      return legacyLockPath;
     });
-    await writeLockfile(lockPath, nextLock, ctx.fs);
-    await removeSupersededFiles(writer, effectiveTarget, previousFiles, entry.files);
-
-    await updateTargetState(ctx, effectiveTarget.name, manifest.id, manifest.version);
 
     formatOutput({
       ctx,
@@ -1033,16 +1150,21 @@ async function performLocalInstall(
         bundle: { id: manifest.id, version: manifest.version },
         written: result.written,
         skipped,
-        lockfile: lockPath
+        lockfile: lockPath,
+        ...(prepared?.migration === undefined ? {} : { migration: prepared.migration })
       },
-      warnings: skippedWarnings(skipped),
+      warnings: installWarnings(skipped, warnings),
       textRenderer: (d) => `Installed ${d.bundle.id}@${d.bundle.version} into target "${d.target}" `
         + `(${d.written.length} written, ${d.skipped.length} skipped). `
         + `Updated ${d.lockfile}.\n`
         + renderSkipped(d.skipped)
+        + renderMigration(d.migration)
     });
     return 0;
   } catch (cause) {
+    if (isRecordError(cause)) {
+      throw cause;
+    }
     const raw = (cause as { code?: string }).code;
     const code = raw !== undefined && /^(BUNDLE|FS|NETWORK|USAGE|CONFIG)\.[A-Z0-9_]+$/.test(raw)
       ? raw
@@ -1107,10 +1229,6 @@ async function performLockfileInstall(
     sourceAwareDependencyCache
   });
 
-  if (replayed.length > 0) {
-    await updateTargetStateFromLockfile(ctx, effectiveTarget.name, lock, replayed);
-  }
-
   const status = failures.length === 0 ? 'ok' : 'warning';
   formatOutput({
     ctx,
@@ -1141,6 +1259,225 @@ async function performLockfileInstall(
     }
   });
   return failures.length === 0 ? 0 : 1;
+}
+
+/** Inputs of {@link performRecordReplay}. */
+interface RecordReplayRun {
+  ctx: Context;
+  fmt: OutputFormat;
+  opts: InstallOptions;
+  /** The selected 3.0.0 record, loaded and checked. */
+  prepared: PreparedRecordSelection;
+  /** The target named by `--target`; only it narrows the replay to one tool. */
+  explicit?: Target;
+}
+
+/** A (bundle, tool) entry the replay did not restore, and why. */
+interface ReplaySkip {
+  bundleId: string;
+  tool: string;
+  reason: string;
+}
+
+/** What {@link performRecordReplay} reports. */
+interface RecordReplayData {
+  level: RecordLevel;
+  records: string[];
+  replayPlanned: number;
+  replayed: { bundleId: string; tool: string; version: string; target: string }[];
+  skipped: ReplaySkip[];
+  needsReinstall: { bundleId: string; version: string }[];
+  failures: ReplaySkip[];
+  /** Bundles only in the old `prompt-registry.*` file, replayed with today's code (BR10.1). */
+  oldFile?: OldFileReplay;
+  /** What the migration run before the replay did (BR22.1). */
+  migration?: MigrationReport;
+}
+
+/** What {@link replayOldFileOnly} reports for the old `prompt-registry.*` file. */
+interface OldFileReplay {
+  /** Absolute path of the old file. */
+  lockfile: string;
+  /** Target the old-file bundles were replayed into; absent when none could be resolved. */
+  target?: string;
+  replayPlanned: number;
+  replayed: string[];
+  failures: { bundleId: string; reason: string }[];
+}
+
+/**
+ * Text output of a record replay.
+ * @param d Output data.
+ * @returns The rendered text, ending with the `Record:` line.
+ */
+function renderRecordReplay(d: RecordReplayData): string {
+  const lines = [
+    `Replay: ${d.replayed.length}/${d.replayPlanned} entr${d.replayPlanned === 1 ? 'y' : 'ies'} installed.`,
+    ...d.replayed.map((r) => `  ${r.bundleId}@${r.version} (${r.tool}) into target "${r.target}"`),
+    ...d.needsReinstall.map((n) => `Needs reinstall: ${n.bundleId}@${n.version} (tool unknown)`),
+    ...d.skipped.map((s) => `Skipped ${s.bundleId} (${s.tool}): ${s.reason}`),
+    ...d.failures.map((f) => `Failed ${f.bundleId} (${f.tool}): ${f.reason}`)
+  ];
+  if (d.oldFile !== undefined) {
+    const old = d.oldFile;
+    lines.push(`Old file ${old.lockfile}: ${String(old.replayed.length)}/${String(old.replayPlanned)} bundle${old.replayPlanned === 1 ? '' : 's'} installed`
+      + (old.target === undefined ? '.' : ` into target "${old.target}".`),
+    ...old.failures.map((f) => `Failed ${f.bundleId}: ${f.reason}`));
+  }
+  return lines.join('\n') + '\n' + renderMigration(d.migration) + renderRecordLine({ level: d.level, records: d.records });
+}
+
+/**
+ * Replay a 3.0.0 install record (W6; BR6.4, BR6.5, BR9.1, NFR4.10, NFR4.11):
+ * each (bundle, tool) entry with a real tool is mapped to a configured
+ * target, its source goes through the trust gate, the recorded version is
+ * fetched and written with that target's writer, and the entry is
+ * re-recorded in the file that holds it. Entries under `unknown` are listed
+ * as needing a reinstall; unmapped or untrusted entries are skipped.
+ * Superseded files are removed after every save.
+ * @param run Replay inputs.
+ * @returns Exit code: 1 when a fetch or write failed, else 0.
+ * @throws {RegistryError} A `RECORD.*` error naming the file.
+ */
+async function performRecordReplay(run: RecordReplayRun): Promise<number> {
+  const { ctx, fmt, opts, prepared, explicit } = run;
+  if (opts.skipUnsupported === true) {
+    throw new RegistryError({
+      code: 'USAGE.INVALID_FLAG',
+      message: 'install: --skip-unsupported cannot be used with a record replay; the replay installs every recorded entry in full',
+      hint: 'Install the bundle on its own: install <bundle-id> --skip-unsupported (or --from <dir>).'
+    });
+  }
+  const { selection, store, service, fs } = prepared;
+  const http = opts.http ?? new NodeHttpClient();
+  const tokens = opts.tokens ?? defaultTokenProvider(ctx.env);
+  const cache = isGitHubAppAuthEnabled(ctx.env) ? createSourceAwareInstallDependencyCache(http, ctx) : undefined;
+  // Local-only files go to the record's info/exclude, also in a git worktree (NFR4.6).
+  const writerFactory = createWriterFactory(ctx, opts, prepared.exclusion);
+  // Every entry is mapped and its source gated before any fetch (NFR4.10, NFR4.11).
+  const plan = await planRecordEntries({
+    service,
+    store,
+    fs,
+    selection,
+    targets: await readTargetsSafely(loadTargets(ctx)),
+    configured: await configuredSources(ctx),
+    explicit,
+    cwd: ctx.cwd(),
+    holdingFile: 'first-holding'
+  });
+  const data: RecordReplayData = {
+    ...await recordOutputFields(selection, fs),
+    replayPlanned: plan.considered,
+    replayed: [],
+    skipped: plan.skipped,
+    needsReinstall: plan.needsReinstall.map((row) => ({ bundleId: row.bundleId, version: row.version })),
+    failures: [],
+    ...(prepared.migration === undefined ? {} : { migration: prepared.migration })
+  };
+  const changes: RecordInstallResult[] = [];
+
+  for (const item of plan.items) {
+    const { bundleId, tool, entry } = item;
+    const source = toLockfileSourceEntry(item.source);
+    const target = resolveEffectiveTarget(ctx, item.target);
+    let written: string[] = [];
+    try {
+      // Record entries carry per-file checksums and no archive checksum;
+      // recordInstall re-checksums the written files.
+      const files = await fetchFilesForSource(
+        source, bundleId, toLockfileBundleEntry(entry), http,
+        tokensForRecordSource(tokens, item.fromRecordOnly), ctx, opts.verbose ?? false, item.fromRecordOnly ? undefined : cache
+      );
+      if (files === null) {
+        data.failures.push({ bundleId, tool, reason: `failed to fetch files from ${source.type} source` });
+        continue;
+      }
+      const manifest = validateManifest(files, {
+        expectedId: source.type === 'artifactory' ? undefined : bundleId,
+        expectedVersion: entry.version,
+        sourceRepoSlug: githubRepoSlugForSource(source)
+      });
+      const { result } = await writeBundleSafely(writerFactory(target), target, files, manifest);
+      written = [...result.written];
+      changes.push(await recordPlannedInstall(
+        service, { ...item, sourceId: entry.sourceId, source, sourceType: entry.sourceType }, target, ctx, manifest.version, written, false
+      ));
+      data.replayed.push({ bundleId, tool, version: manifest.version, target: target.name });
+    } catch (cause) {
+      if (isRecordError(cause)) {
+        throw toCommandRecordError('install', cause, written);
+      }
+      data.failures.push({ bundleId, tool, reason: cause instanceof Error ? cause.message : String(cause) });
+    }
+  }
+
+  const warnings = [...plan.notes, ...await finishRecordRun(service, changes)];
+
+  // Bundles only in the old file replay as today; the record wins for the others (BR10.1, W6 step 4).
+  data.oldFile = await replayOldFileOnly(run, { http, tokens, cache });
+  warnings.push(
+    ...data.skipped.map((s) => `${s.bundleId} (${s.tool}): ${s.reason}`),
+    ...data.needsReinstall.map((n) => `${n.bundleId}: needs reinstall`),
+    ...data.failures.map((f) => `${f.bundleId} (${f.tool}): ${f.reason}`),
+    ...(data.oldFile?.failures ?? []).map((f) => `${f.bundleId}: ${f.reason}`)
+  );
+
+  formatOutput({
+    ctx,
+    command: 'install',
+    output: fmt,
+    status: warnings.length === 0 ? 'ok' : 'warning',
+    data,
+    warnings: warnings.length === 0 ? undefined : warnings,
+    textRenderer: renderRecordReplay
+  });
+  // Exit 1 when nothing at all could be processed: every planned entry was skipped (BR6.4).
+  const nothingProcessed = data.replayPlanned > 0 && data.replayed.length === 0 && data.failures.length === 0
+    && (data.oldFile === undefined || data.oldFile.replayed.length === 0);
+  const failed = data.failures.length > 0 || (data.oldFile?.failures.length ?? 0) > 0;
+  return failed || nothingProcessed ? 1 : 0;
+}
+
+/**
+ * Replay the bundles that are only in the selected level's old
+ * `prompt-registry.*` file with today's code, on that file, writing nothing
+ * about them into the new record (BR10.1; W6 step 4). They go to the
+ * `--target` target, else the only configured target; otherwise each is
+ * reported as a replay failure with the missing-target message (BR23.2).
+ * @param run Replay inputs.
+ * @param fetch HTTP client, token provider and source-aware dependency cache.
+ * @param fetch.http HTTP client.
+ * @param fetch.tokens Token provider.
+ * @param fetch.cache Source-aware dependency cache, when GitHub App auth is on.
+ * @returns What was replayed, or `undefined` when there is no old-file-only bundle.
+ */
+async function replayOldFileOnly(
+  run: RecordReplayRun,
+  fetch: { http: HttpClient; tokens: TokenProvider; cache?: SourceAwareInstallDependencyCache }
+): Promise<OldFileReplay | undefined> {
+  const { ctx, opts, prepared, explicit } = run;
+  const old = await prepareOldFileOnly(ctx, prepared, { command: 'install', target: explicit, overrides: opts });
+  if (old === undefined) {
+    return undefined;
+  }
+  const { lockPath, lock, bundleIds } = old;
+  if ('reason' in old) {
+    return { lockfile: lockPath, replayPlanned: bundleIds.length, replayed: [], failures: bundleIds.map((bundleId) => ({ bundleId, reason: old.reason })) };
+  }
+  const { target } = old;
+  const { replayed, failures } = await replayLockfileEntries({
+    bundleIds,
+    lock,
+    http: fetch.http,
+    tokens: fetch.tokens,
+    writer: createWriterFactory(ctx, opts)(target),
+    target,
+    ctx,
+    verbose: opts.verbose ?? false,
+    sourceAwareDependencyCache: fetch.cache
+  });
+  return { lockfile: lockPath, target: target.name, replayPlanned: bundleIds.length, replayed, failures };
 }
 
 /**
@@ -1262,44 +1599,44 @@ async function performRemoteInstall(
       });
       return 0;
     }
-    const writerFactory = createWriterFactory(ctx, opts);
+    // Repository scope: check both record files before anything is written (BR3.5).
+    // User scope: check the shared user record and the target folder (BR14.3).
+    const prepared = await prepareRecordForTarget(ctx, effectiveTarget);
+    const writerFactory = createWriterFactory(ctx, opts, prepared?.exclusion);
     const writer = writerFactory(effectiveTarget);
     const { installableFiles: targetFiles, result, skipped } = await writeBundleForInstall(
       writer, effectiveTarget, files, manifest, { skipUnsupported: opts.skipUnsupported === true }
     );
-    const scope = effectiveTarget.scope;
-    const commitMode = effectiveTarget.commitMode ?? 'commit';
-    const lockPath = lockfilePathForTarget(ctx, effectiveTarget);
-    const existing = await readLockfile(lockPath, ctx.fs) ?? emptyLockfile('ai-primitives-hub-cli');
-    const entry: LockfileBundleEntry = {
+    // No configured source: the GitHub repository the bundle was resolved from.
+    const recordSource = opts.sourceConfig === undefined
+      ? { type: 'github', url: `https://github.com/${repoSlug}` }
+      : toRecordSource(opts.sourceConfig);
+    // The old lockfile never kept a branch.
+    const { branch: _branch, ...sourceDetails } = toLockfileSourceEntry(recordSource);
+    const { lockPath, warnings } = await persistInstall(prepared, {
+      bundleId: lockKey,
       version: manifest.version,
-      sourceId: installable.ref.sourceId,
-      sourceType: installable.ref.sourceType,
-      checksum: dl.sha256,
-      installedAt: new Date().toISOString(),
-      files: checksumFiles(targetFiles, result.writtenBundlePaths ?? targetFiles.keys(), result.installedPaths)
-    };
-    if (scope === 'repository') {
-      entry.commitMode = commitMode;
-    }
-    const previousFiles = existing.bundles[lockKey]?.files;
-    let nextLock = upsertBundleEntry(existing, lockKey, entry);
-    const sourceConfig = opts.sourceConfig;
-    const collectionsPath = sourceConfig?.config?.collectionsPath;
-    nextLock = upsertSource(nextLock, installable.ref.sourceId, {
-      type: sourceConfig?.type ?? 'github',
-      url: sourceConfig?.url ?? `https://github.com/${repoSlug}`,
-      ...(collectionsPath ? { collectionsPath } : {}),
-      ...(sourceConfig?.type === 'artifactory'
-        ? {
-          indexFile: typeof sourceConfig.config?.indexFile === 'string' ? sourceConfig.config.indexFile : undefined,
-          authMode: sourceConfig.config?.authMode === 'bearer' ? 'bearer' : 'anonymous',
-          credentialRef: typeof sourceConfig.config?.credentialRef === 'string' ? sourceConfig.config.credentialRef : undefined
-        }
-        : {})
+      tool: effectiveTarget.type,
+      source: { sourceId: installable.ref.sourceId, ...recordSource },
+      writtenPaths: result.written
+    }, async () => {
+      const legacyLockPath = lockfilePathForTarget(ctx, effectiveTarget);
+      const existing = await readLockfile(legacyLockPath, ctx.fs) ?? emptyLockfile('ai-primitives-hub-cli');
+      const entry: LockfileBundleEntry = {
+        version: manifest.version,
+        sourceId: installable.ref.sourceId,
+        sourceType: installable.ref.sourceType,
+        checksum: dl.sha256,
+        installedAt: new Date().toISOString(),
+        files: checksumFiles(targetFiles, result.writtenBundlePaths ?? targetFiles.keys(), result.installedPaths)
+      };
+      const previousFiles = existing.bundles[lockKey]?.files;
+      let nextLock = upsertBundleEntry(existing, lockKey, entry);
+      nextLock = upsertSource(nextLock, installable.ref.sourceId, sourceDetails);
+      await writeLockfile(legacyLockPath, nextLock, ctx.fs);
+      await removeSupersededFiles(writer, effectiveTarget, previousFiles, entry.files);
+      return legacyLockPath;
     });
-    await writeLockfile(lockPath, nextLock, ctx.fs);
-    await removeSupersededFiles(writer, effectiveTarget, previousFiles, entry.files);
 
     formatOutput({
       ctx,
@@ -1313,13 +1650,15 @@ async function performRemoteInstall(
         sha256: dl.sha256,
         written: result.written,
         skipped,
-        lockfile: lockPath
+        lockfile: lockPath,
+        ...(prepared?.migration === undefined ? {} : { migration: prepared.migration })
       },
-      warnings: skippedWarnings(skipped),
+      warnings: installWarnings(skipped, warnings),
       textRenderer: (d) => `Installed ${d.bundle.id}@${d.bundle.version} from ${d.source.repo} `
         + `into target "${d.target}" (${d.written.length} written, ${d.skipped.length} skipped). `
         + `Updated ${d.lockfile}.\n`
         + renderSkipped(d.skipped)
+        + renderMigration(d.migration)
     });
     return 0;
   } catch (cause) {
@@ -1343,68 +1682,6 @@ async function performRemoteInstall(
       cause: cause instanceof Error ? cause : undefined
     });
   }
-}
-
-/**
- * Update target state with installed bundle.
- * @param ctx CLI context.
- * @param targetName Target name.
- * @param bundleId Bundle ID.
- * @param version Bundle version.
- */
-async function updateTargetState(ctx: Context, targetName: string, bundleId: string, version: string): Promise<void> {
-  const stateStore = new TargetStateStore({
-    fs: ctx.fs,
-    statePath: path.join(ctx.cwd(), '.ai-primitives-hub', 'target-state.json')
-  });
-  const existingState = await stateStore.load(targetName);
-  const newBundles = existingState?.lastInstalledBundles ?? [];
-  const bundleIndex = newBundles.findIndex((b) => b.bundleId === bundleId);
-  const bundleState = { bundleId, version, installedAt: new Date().toISOString() };
-  if (bundleIndex === -1) {
-    newBundles.push(bundleState);
-  } else {
-    newBundles[bundleIndex] = bundleState;
-  }
-  await stateStore.save({
-    targetName,
-    lastInstalledBundles: newBundles,
-    lastUsedAt: new Date().toISOString()
-  });
-}
-
-/**
- * Update target state from lockfile entries.
- * @param ctx CLI context.
- * @param targetName Target name.
- * @param lock Lockfile.
- * @param replayed Replayed bundle IDs.
- */
-async function updateTargetStateFromLockfile(ctx: Context, targetName: string, lock: Lockfile, replayed: string[]): Promise<void> {
-  const stateStore = new TargetStateStore({
-    fs: ctx.fs,
-    statePath: path.join(ctx.cwd(), '.ai-primitives-hub', 'target-state.json')
-  });
-  const existingState = await stateStore.load(targetName);
-  const newBundles = existingState?.lastInstalledBundles ?? [];
-  for (const bundleId of replayed) {
-    const entry = lock.bundles[bundleId];
-    if (entry === undefined) {
-      continue;
-    }
-    const bundleIndex = newBundles.findIndex((b) => b.bundleId === bundleId);
-    const bundleState = { bundleId, version: entry.version, installedAt: entry.installedAt };
-    if (bundleIndex === -1) {
-      newBundles.push(bundleState);
-    } else {
-      newBundles[bundleIndex] = bundleState;
-    }
-  }
-  await stateStore.save({
-    targetName,
-    lastInstalledBundles: newBundles,
-    lastUsedAt: new Date().toISOString()
-  });
 }
 
 /**
@@ -1437,55 +1714,6 @@ export async function installBundleWithSource(
   };
   return performRemoteInstall(opts, target, ctx, fmt);
 }
-
-/**
- * Build the `install` command (factory function for backward compatibility).
- * @param opts - Command options.
- * @returns CommandDefinition wired to the framework adapter.
- */
-export const createInstallCommand = (
-  opts: InstallOptions = {}
-): CommandDefinition =>
-  defineCommand({
-    path: ['install'],
-    description: 'Install bundles to a configured target.',
-    category: 'Install & Manage',
-    run: async ({ ctx }: { ctx: Context }): Promise<number> => {
-      const fmt = opts.output ?? 'text';
-      const { bundle: noBundle, lockfile: noLockfile } = validateInputs(opts, { flags: ['bundle', 'lockfile'] });
-      if (noBundle && noLockfile) {
-        return failWith(ctx, fmt, 'install', new RegistryError({
-          code: 'USAGE.MISSING_FLAG',
-          message: 'install: provide either <bundle-id> (imperative) or --lockfile <path> (declarative)',
-          hint: 'Examples:\n'
-            + '  ai-primitives-hub install <bundle-id>\n'
-            + '  ai-primitives-hub install --lockfile prompt-registry.lock.json'
-        }));
-      }
-
-      try {
-        const targetName = await resolveTargetName(opts.target, 'install', ctx, () => loadTargets(ctx));
-        checkAllowTarget(targetName, opts);
-        const configuredTarget = await resolveTarget(targetName, 'install', ctx, () => loadTargets(ctx));
-        const target = resolveEffectiveTarget(ctx, configuredTarget, opts);
-
-        if (opts.from !== undefined && opts.from.length > 0) {
-          return await performLocalInstall(opts, target, ctx, fmt);
-        }
-
-        if (opts.lockfile !== undefined && opts.lockfile.length > 0) {
-          return await performLockfileInstall(opts, target, ctx, fmt);
-        }
-
-        return await performRemoteInstall(opts, target, ctx, fmt);
-      } catch (err) {
-        if (err instanceof RegistryError) {
-          return failWith(ctx, fmt, 'install', err);
-        }
-        throw err;
-      }
-    }
-  });
 
 /**
  * Replay lockfile entries for installation.

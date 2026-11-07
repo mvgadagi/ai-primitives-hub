@@ -101,8 +101,10 @@ import {
   HubYamlIntelligence,
 } from './services/hub-yaml-intelligence';
 import {
-  LockfileManager,
-} from './services/lockfile-manager';
+  watchInstallRecords,
+  watchOldLockfiles,
+  watchUserRecord,
+} from './services/install-record-listing';
 import {
   MigrationRegistry,
 } from './services/migration-registry';
@@ -434,8 +436,11 @@ export class PromptRegistryExtension {
   private telemetryService: TelemetryService | undefined;
 
   // Repository-level installation services
-  private lockfileManager: LockfileManager | undefined;
   private repositoryActivationService: RepositoryActivationService | undefined;
+  /** Record roots with an install record watcher (deduplicated across folders). */
+  private readonly watchedRecordRoots = new Set<string>();
+  /** Workspace folders with an old lockfile watcher. */
+  private readonly watchedOldFolders = new Set<string>();
 
   private disposables: vscode.Disposable[] = [];
 
@@ -1148,22 +1153,57 @@ export class PromptRegistryExtension {
   }
 
   /**
-   * Subscribe to lockfile changes for a workspace and refresh UI when lockfile is modified externally.
-   * This ensures the UI stays in sync when the lockfile is created, modified, or deleted outside the extension.
-   * @param lockfileManager - The LockfileManager instance for the workspace
-   * @returns Disposable subscription that should be added to disposables
+   * Watch the install records of a workspace folder and refresh the installed
+   * view on any change (BR5.7): one watcher per record root (git root, or the
+   * folder), shared by every folder with that root, plus one on the folder's
+   * old `prompt-registry*.lock.json` files. A failure to set up a watcher is
+   * logged and never blocks activation.
+   * @param workspaceFolder - Workspace folder the git-root walk starts from.
    */
-  private subscribeLockfileChanges(lockfileManager: LockfileManager): vscode.Disposable {
-    const onExternalUpdate = lockfileManager.onExternalLockfileUpdated ?? lockfileManager.onLockfileUpdated;
-    return onExternalUpdate(() => {
-      this.logger.debug('Lockfile changed externally, refreshing repository bundles');
+  private async subscribeRecordChanges(workspaceFolder: string): Promise<void> {
+    const refresh = (): void => {
+      this.logger.debug('Install record changed, refreshing repository bundles');
       this.registryManager.handleWorkspaceFoldersChanged();
-    });
+    };
+    try {
+      const root = await this.registryManager.getRecordAdapter().resolveRoot(workspaceFolder);
+      if (!this.watchedRecordRoots.has(root)) {
+        this.watchedRecordRoots.add(root);
+        this.disposables.push(watchInstallRecords(root, refresh));
+      }
+      if (!this.watchedOldFolders.has(workspaceFolder)) {
+        this.watchedOldFolders.add(workspaceFolder);
+        this.disposables.push(watchOldLockfiles(workspaceFolder, refresh));
+      }
+    } catch (error) {
+      this.logger.warn('Failed to set up install record watcher:', error instanceof Error ? error : undefined);
+    }
   }
 
   /**
-   * Initialize repository-level installation services
-   * Sets up LockfileManager and RepositoryActivationService per workspace folder
+   * Watch the shared user record and refresh the installed view on any
+   * change, like the repository record watchers (BR16.x). Not set up in WSL,
+   * where the user record is not used; a failure is logged and never blocks
+   * activation.
+   */
+  private subscribeUserRecordChanges(): void {
+    try {
+      if (!this.registryManager.getRecordAdapter().usesSharedUserRecord()) {
+        return;
+      }
+      const refresh = (): void => {
+        this.logger.debug('User record changed, refreshing installed bundles');
+        this.registryManager.handleWorkspaceFoldersChanged();
+      };
+      this.disposables.push(watchUserRecord(this.registryManager.getStorage().getPaths().userRecord, refresh));
+    } catch (error) {
+      this.logger.warn('Failed to set up user record watcher:', error instanceof Error ? error : undefined);
+    }
+  }
+
+  /**
+   * Initialize repository-level installation services: record watchers for
+   * every workspace folder, and the RepositoryActivationService of the first one.
    */
   private async initializeRepositoryServices(): Promise<void> {
     try {
@@ -1179,17 +1219,16 @@ export class PromptRegistryExtension {
       // Get repository path from first workspace folder
       const repositoryPath = workspaceFolders[0].uri.fsPath;
 
-      // Initialize LockfileManager for this workspace
-      this.lockfileManager = LockfileManager.getInstance(repositoryPath);
-
-      // Subscribe to lockfile changes to refresh UI when lockfile is modified externally
-      this.disposables.push(this.subscribeLockfileChanges(this.lockfileManager));
+      // Watch the install records of every workspace folder (BR5.7)
+      for (const folder of workspaceFolders) {
+        await this.subscribeRecordChanges(folder.uri.fsPath);
+      }
 
       // Initialize RepositoryActivationService for this workspace
       const registryStorage = this.registryManager.getStorage();
       this.repositoryActivationService = RepositoryActivationService.getInstance(
         repositoryPath,
-        this.lockfileManager,
+        this.registryManager.getRecordAdapter(),
         this.hubManager,
         registryStorage,
         this.registryManager, // Pass RegistryManager for missing bundle installation
@@ -1205,7 +1244,7 @@ export class PromptRegistryExtension {
 
       if (repositoryScopeService) {
         // Create ScopeConflictResolver with storage
-        const scopeConflictResolver = new ScopeConflictResolver(registryStorage);
+        const scopeConflictResolver = new ScopeConflictResolver(registryStorage, this.registryManager.userRecordReader());
 
         this.bundleScopeCommands = new BundleScopeCommands(
           this.registryManager,
@@ -1234,17 +1273,14 @@ export class PromptRegistryExtension {
       const repositoryPath = workspaceFolder.uri.fsPath;
       this.logger.info(`Initializing repository services for workspace: ${repositoryPath}`);
 
-      // Initialize LockfileManager for this workspace
-      const lockfileManager = LockfileManager.getInstance(repositoryPath);
-
-      // Subscribe to lockfile changes to refresh UI when lockfile is modified externally
-      this.disposables.push(this.subscribeLockfileChanges(lockfileManager));
+      // Watch the install records of this workspace folder
+      await this.subscribeRecordChanges(repositoryPath);
 
       // Initialize RepositoryActivationService for this workspace
       const registryStorage = this.registryManager.getStorage();
       const activationService = RepositoryActivationService.getInstance(
         repositoryPath,
-        lockfileManager,
+        this.registryManager.getRecordAdapter(),
         this.hubManager,
         registryStorage,
         this.registryManager, // Pass RegistryManager for missing bundle installation
@@ -1278,7 +1314,6 @@ export class PromptRegistryExtension {
         const repositoryPath = folder.uri.fsPath;
 
         // Reset instances for the removed workspace
-        LockfileManager.resetInstance(repositoryPath);
         RepositoryActivationService.resetInstance(repositoryPath);
       }
 
@@ -1923,6 +1958,9 @@ export class PromptRegistryExtension {
 
       // Initialize repository-level installation services
       await this.initializeRepositoryServices();
+
+      // Watch the shared user record (BR16.x)
+      this.subscribeUserRecordChanges();
 
       // Register workspace folder change listener
       this.registerWorkspaceFolderListener();

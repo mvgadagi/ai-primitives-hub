@@ -6,17 +6,25 @@
  * as-is (single root under `globalStorageUri`, unlike `infra`'s
  * `XdgAppStorage` which splits config/cache/data across three XDG
  * bases) — real users' data already lives here (ADR-0005 decision 3).
+ * It implements the extension-only `ExtensionAppStorage`, so it also
+ * returns the per-profile bundle-record folders `RegistryStorage` uses.
  */
 
 import * as path from 'node:path';
-import type {
-  AppStorage,
-  AppStoragePaths,
+import {
+  USER_RECORD_FILE_NAME,
 } from '@ai-primitives-hub/core';
+import {
+  xdgConfigDir,
+} from '@ai-primitives-hub/infra';
 import * as vscode from 'vscode';
+import type {
+  ExtensionAppStorage,
+  ExtensionStoragePaths,
+} from './extension-app-storage';
 
-export class VsCodeAppStorage implements AppStorage {
-  private readonly paths: AppStoragePaths;
+export class VsCodeAppStorage implements ExtensionAppStorage {
+  private readonly paths: ExtensionStoragePaths;
 
   public constructor(private readonly context: vscode.ExtensionContext) {
     const storagePath = context.globalStorageUri.fsPath;
@@ -31,11 +39,14 @@ export class VsCodeAppStorage implements AppStorage {
       userInstalled: path.join(storagePath, 'installed', 'user'),
       profilesInstalled: path.join(storagePath, 'installed', 'profiles'),
       profiles: path.join(storagePath, 'profiles'),
-      logs: path.join(storagePath, 'logs')
+      logs: path.join(storagePath, 'logs'),
+      // The user record is per machine, not per profile: it lives in the same
+      // XDG config folder the CLI uses, never under globalStorageUri (BR14.1).
+      userRecord: path.join(xdgConfigDir(process.env), USER_RECORD_FILE_NAME)
     };
   }
 
-  public getPaths(): AppStoragePaths {
+  public getPaths(): ExtensionStoragePaths {
     return { ...this.paths };
   }
 

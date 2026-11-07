@@ -1,0 +1,157 @@
+/**
+ * Source trust gate for record replay and update (NFR4.11; nfr-design
+ * security-design "Source trust gate").
+ *
+ * A record may come from a cloned repository, so its sources are not trusted:
+ * 1. A configured source with the same id (active hub first, then detached
+ *    sources; the caller builds the map in that order) always wins, with its
+ *    own URL, branch and credentials, normalised by `toRecordSource`. The
+ *    recorded copy is not compared, so any earlier record of that id passes.
+ * 2. Otherwise the record's copy is used without `credentialRef` and
+ *    `authMode`, so a fetch never reads an environment variable the record named.
+ * 3. A `local` source from the record is resolved against the repository root
+ *    when relative, realpath'd, and must stay inside the realpath'd root;
+ *    otherwise the entry is skipped.
+ *
+ * The caller runs this once per entry before anything contacts a source (the
+ * version lookup, any download, and under `--dry-run`), and uses the decided
+ * source for both the lookup and the download.
+ * @module records/resolve-record-source
+ */
+import * as path from 'node:path';
+import {
+  DEFAULT_LOCAL_HUB_ID,
+  type RecordFs,
+  type RegistrySource,
+  relativeInside,
+  type SourceRecord,
+} from '@ai-primitives-hub/core';
+import {
+  copySourceFields,
+  SOURCE_FIELDS_WITHOUT_CREDENTIALS,
+} from './source-fields';
+import {
+  toRecordSource,
+} from './to-record-source';
+
+/** Outcome of {@link resolveRecordSource}. */
+export type SourceDecision =
+  /** Fetch from this source; `sourceId` is the record key. */
+  | { use: SourceRecord & { sourceId: string } }
+  /** Do not fetch; skip the entry and report the reason. */
+  | { skip: string };
+
+/** Reason reported for a `local` record source that leaves the repository. */
+export const LOCAL_SOURCE_OUTSIDE_REASON = 'local source outside the repository';
+
+/**
+ * Whether a source type reads a folder on disk, kept in its `url`: `local`
+ * and every `local-*` type (for example `local-skills`).
+ * @param type - Source type.
+ */
+export const isLocalType = (type: string): boolean => type === 'local' || type.startsWith('local-');
+
+/**
+ * The record's copy without credentials, prototype-free.
+ * @param sourceId - Record key.
+ * @param fromRecord - Source as recorded.
+ * @param url - URL to use.
+ */
+const fromRecordCopy = (sourceId: string, fromRecord: SourceRecord, url: string): SourceRecord & { sourceId: string } =>
+  Object.assign(copySourceFields(fromRecord, fromRecord.type, url, SOURCE_FIELDS_WITHOUT_CREDENTIALS), { sourceId });
+
+/**
+ * Realpath of a recorded `local` folder, when it stays inside the repository root.
+ * @param fs - Filesystem port.
+ * @param root - Repository root.
+ * @param recordedPath - Recorded folder path, relative to the root or absolute.
+ */
+const confineLocalFolder = async (fs: RecordFs, root: string, recordedPath: string): Promise<string | undefined> => {
+  try {
+    const realRoot = await fs.realpath(root);
+    const realFolder = await fs.realpath(path.resolve(root, recordedPath));
+    // The repository root itself is an allowed local source folder.
+    return relativeInside(realRoot, realFolder, { allowRoot: true }) === undefined ? undefined : realFolder;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Whether a `local` source folder stays inside the repository root once every
+ * symlink is resolved (NFR4.14). A relative path is taken from the root; a
+ * symlink inside the root that points outside it counts as outside, and a
+ * folder that does not resolve is not inside.
+ * @param fs - Filesystem port.
+ * @param root - Repository root.
+ * @param localPath - The source's folder, relative to the root or absolute.
+ * @returns `true` only when the realpath of the folder is the realpath'd root or below it.
+ */
+export const isLocalSourceInsideRoot = async (fs: RecordFs, root: string, localPath: string): Promise<boolean> =>
+  (await confineLocalFolder(fs, root, localPath)) !== undefined;
+
+/**
+ * Configured sources in the trust gate's lookup order (NFR4.11, NFR4.15),
+ * one per id, the first occurrence winning: the active hub's sources, then
+ * detached (`default-local`) sources, then, with `includeOtherHubs`, any
+ * other stored source. Within a tier the given order is kept.
+ * @param sources - Configured sources, each with its `hubId`.
+ * @param activeHubId - Active hub id; `null` when no hub is active.
+ * @param options - Lookup options.
+ * @param options.includeOtherHubs - Keep sources of other hubs, last (the extension's stored sources).
+ * @returns The ordered sources.
+ */
+export const orderConfiguredSources = (
+  sources: readonly RegistrySource[],
+  activeHubId: string | null,
+  options: { includeOtherHubs?: boolean } = {}
+): RegistrySource[] => {
+  const tier = (source: RegistrySource): number => {
+    if (activeHubId !== null && source.hubId === activeHubId) {
+      return 0;
+    }
+    return source.hubId === DEFAULT_LOCAL_HUB_ID ? 1 : 2;
+  };
+  const byId = new Map<string, RegistrySource>();
+  const ranked = sources.map((source, index) => ({ source, index, rank: tier(source) }))
+    .filter(({ rank }) => rank < 2 || options.includeOtherHubs === true)
+    .toSorted((left, right) => left.rank - right.rank || left.index - right.index);
+  for (const { source } of ranked) {
+    if (!byId.has(source.id)) {
+      byId.set(source.id, source);
+    }
+  }
+  return [...byId.values()];
+};
+
+/**
+ * Decide which source an entry is replayed or updated from (NFR4.11).
+ * @param sourceId - The entry's `sourceId`.
+ * @param fromRecord - The record's copy of that source.
+ * @param configured - Configured sources by id: the active hub's first, then detached sources.
+ * @param root - Repository root a relative `local` path is resolved against.
+ * @param fs - Filesystem port, for the `local` realpath check.
+ * @returns The source to use, or why the entry is skipped.
+ */
+export const resolveRecordSource = async (
+  sourceId: string,
+  fromRecord: SourceRecord,
+  configured: ReadonlyMap<string, RegistrySource>,
+  root: string,
+  fs: RecordFs
+): Promise<SourceDecision> => {
+  const match = configured.get(sourceId);
+  if (match !== undefined) {
+    // Normalised as an install records it, so a record written before
+    // `toRecordSource` existed is accepted and re-recorded the same way.
+    return { use: toRecordSource(match, sourceId) };
+  }
+  if (!isLocalType(fromRecord.type)) {
+    return { use: fromRecordCopy(sourceId, fromRecord, fromRecord.url) };
+  }
+  // Same check as `isLocalSourceInsideRoot`, keeping the realpath it resolved.
+  const folder = await confineLocalFolder(fs, root, fromRecord.url);
+  return folder === undefined
+    ? { skip: LOCAL_SOURCE_OUTSIDE_REASON }
+    : { use: fromRecordCopy(sourceId, fromRecord, folder) };
+};
