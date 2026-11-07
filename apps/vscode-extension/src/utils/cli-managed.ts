@@ -3,7 +3,8 @@
  * `RECORD.CLI_MANAGED`).
  *
  * The extension changes only its own tool's entries in the shared install
- * record. An update, uninstall, move or commit-mode switch of a bundle whose
+ * record, at repository level and in the shared user record. An update,
+ * uninstall, move or commit-mode switch of a bundle whose
  * record entries all belong to another tool (e.g. `kiro` while the extension
  * runs in VS Code) is refused with a core `RegistryError` of code
  * `RECORD.CLI_MANAGED`, never a silent return, so no caller can report it as
@@ -14,6 +15,7 @@
 import {
   isRecordError,
   recordError,
+  type RecordLevel,
   type RegistryError,
 } from '@ai-primitives-hub/core';
 import * as vscode from 'vscode';
@@ -38,23 +40,31 @@ const CLI_COMMANDS: Readonly<Record<CliManagedAction, string>> = {
  * @param bundleId - Refused bundle.
  * @param action - Refused action.
  * @param tool - Tool the bundle's entry belongs to.
+ * @param level - Record level of the entry; a user-level entry names "a <tool> user target" (BR11.2 at user level).
  * @returns `<bundle> is installed for <tool>; change it with the CLI: ai-primitives-hub <action> <bundle> --target <a <tool> target>`.
  */
-export const cliManagedMessage = (bundleId: string, action: CliManagedAction, tool: string): string =>
-  `${bundleId} is installed for ${tool}; change it with the CLI: ai-primitives-hub ${CLI_COMMANDS[action]} ${bundleId} --target <a ${tool} target>`;
+export const cliManagedMessage = (bundleId: string, action: CliManagedAction, tool: string, level: RecordLevel = 'repository'): string =>
+  `${bundleId} is installed for ${tool}; change it with the CLI: ai-primitives-hub ${CLI_COMMANDS[action]} ${bundleId} `
+  + `--target <a ${tool}${level === 'user' ? ' user' : ''} target>`;
 
 /**
  * Build the `RECORD.CLI_MANAGED` refusal.
  * @param bundleId - Refused bundle.
  * @param action - Refused action.
  * @param tool - Tool the bundle's entry belongs to.
+ * @param level - Record level of the entry; a user-level refusal also carries `level` in its context.
  * @returns The error, ready to throw.
  */
-export const cliManagedError = (bundleId: string, action: CliManagedAction, tool: string): RegistryError =>
+export const cliManagedError = (
+  bundleId: string,
+  action: CliManagedAction,
+  tool: string,
+  level: RecordLevel = 'repository'
+): RegistryError =>
   recordError('RECORD.CLI_MANAGED', {
-    message: cliManagedMessage(bundleId, action, tool),
+    message: cliManagedMessage(bundleId, action, tool, level),
     hint: '',
-    context: { bundleId, action, tool }
+    context: { bundleId, action, tool, ...(level === 'user' ? { level } : {}) }
   });
 
 /**
