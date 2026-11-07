@@ -48,14 +48,13 @@ import type {
   Target,
 } from '@ai-primitives-hub/core';
 import {
-  FileSystemLayoutConfigLoader,
   type RepositoryCommitMode,
   RepositoryScopeWriter,
   RepositoryScopeWriterAdapter,
-  resolveUserConfigDir,
   TargetStateStore,
 } from '@ai-primitives-hub/infra';
 import {
+  createLayoutLoader,
   Command,
   type CommandDefinition,
   type Context,
@@ -71,7 +70,7 @@ import {
   type PreparedRepositoryUninstall,
   prepareRecordSelection,
   prepareRepositoryUninstall,
-  prepareUserUninstall,
+  prepareUninstallForTarget,
   readTargetsSafely,
   recordOutputFields,
   type RecordOutputFields,
@@ -301,11 +300,7 @@ export const createWriterFactory = (
   // path that `writer.write()` used (targets with a real, non-identity
   // transformer like Kiro would otherwise resolve the wrong path).
   const transformerRegistry = TransformerRegistry.withBuiltIns();
-  const layoutLoader = new FileSystemLayoutConfigLoader({
-    cwd: ctx.cwd(),
-    fs: ctx.fs,
-    userConfigDir: resolveUserConfigDir(ctx.env)
-  });
+  const layoutLoader = createLayoutLoader(ctx);
 
   return (target: Target): TargetWriter => {
     const effectiveTarget = resolveEffectiveTarget(ctx, target, opts);
@@ -553,17 +548,13 @@ async function performBundleUninstall(
   fmt: OutputFormat
 ): Promise<number> {
   const bundleId = opts.bundle as string;
-  if (target.scope === 'repository' || target.scope === 'user') {
-    // The new record files are loaded first: a RECORD.* error stops here
-    // with nothing removed. A bundle recorded there for this target's type is
-    // uninstalled from the record; any other falls back to the old store.
-    const prepared = target.scope === 'repository'
-      ? await prepareRepositoryUninstall(ctx, target)
-      : await prepareUserUninstall(ctx, target);
-    const recordedFiles = prepared.entries.get(bundleId);
-    if (recordedFiles !== undefined) {
-      return await performRecordBundleUninstall({ opts, target, ctx, fmt }, prepared, bundleId, recordedFiles);
-    }
+  // The record files are loaded first: a RECORD.* error stops here with
+  // nothing removed. A bundle recorded there for this target's type is
+  // uninstalled from the record; any other falls back to the old store.
+  const prepared = await prepareUninstallForTarget(ctx, target);
+  const recordedFiles = prepared?.entries.get(bundleId);
+  if (prepared !== undefined && recordedFiles !== undefined) {
+    return await performRecordBundleUninstall({ opts, target, ctx, fmt }, prepared, bundleId, recordedFiles);
   }
   const entry = await findBundleEntry(bundleId, target, opts, ctx);
 
@@ -849,12 +840,7 @@ async function performAllUninstall(
   // same way. Bundles recorded there for this target's type are uninstalled
   // from the record; the old store is then handled as before, so bundles
   // installed before the record still go.
-  let prepared: PreparedRepositoryUninstall | undefined;
-  if (target.scope === 'repository') {
-    prepared = await prepareRepositoryUninstall(ctx, target);
-  } else if (target.scope === 'user') {
-    prepared = await prepareUserUninstall(ctx, target);
-  }
+  const prepared = await prepareUninstallForTarget(ctx, target);
   const recordedIds = prepared === undefined ? [] : [...prepared.entries.keys()];
   // An id uninstalled from the record is not removed again from the old
   // store, so each id is handled and reported once.

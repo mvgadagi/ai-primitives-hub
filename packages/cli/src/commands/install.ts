@@ -70,7 +70,6 @@ import {
   AwesomeCopilotBundleResolver,
   createGitHubSourceAuthRuntime,
   defaultTokenProvider,
-  FileSystemLayoutConfigLoader,
   GitHubApiClient,
   GitHubBundleResolver,
   type GitHubSourceAuthRuntime,
@@ -83,13 +82,13 @@ import {
   type RepositoryCommitMode,
   RepositoryScopeWriter,
   RepositoryScopeWriterAdapter,
-  resolveUserConfigDir,
   SourceDispatcher,
   StaticTokenProvider,
   TargetStateStore,
   ZipBundleExtractor,
 } from '@ai-primitives-hub/infra';
 import {
+  createLayoutLoader,
   Command,
   type CommandDefinition,
   configuredSources,
@@ -108,9 +107,8 @@ import {
   type PreparedRecordSelection,
   type PreparedRepositoryRecord,
   prepareOldFileOnly,
+  prepareRecordForTarget,
   prepareRecordSelection,
-  prepareRepositoryRecord,
-  prepareUserRecord,
   readTargetsSafely,
   recordOutputFields,
   recordPlannedInstall,
@@ -769,11 +767,7 @@ export const createWriterFactory = (
 ): (target: Target) => TargetWriter => {
   // Create transformer registry and hierarchical layout loader once per command.
   const transformerRegistry = TransformerRegistry.withBuiltIns();
-  const layoutLoader = new FileSystemLayoutConfigLoader({
-    cwd: ctx.cwd(),
-    fs: ctx.fs,
-    userConfigDir: resolveUserConfigDir(ctx.env)
-  });
+  const layoutLoader = createLayoutLoader(ctx);
 
   return (target: Target): TargetWriter => {
     const effectiveTarget = resolveEffectiveTarget(ctx, target, opts);
@@ -1093,9 +1087,7 @@ async function performLocalInstall(
     // writer runs, so a RECORD.* error stops here with nothing written (BR3.5).
     // User scope: the shared user record is checked the same way, and a
     // target folder outside home is refused (BR14.3).
-    const prepared = effectiveTarget.scope === 'repository'
-      ? await prepareRepositoryRecord(ctx, effectiveTarget)
-      : (effectiveTarget.scope === 'user' ? await prepareUserRecord(ctx, effectiveTarget) : undefined);
+    const prepared = await prepareRecordForTarget(ctx, effectiveTarget);
     const writerFactory = createWriterFactory(ctx, opts, prepared?.exclusion);
     const writer = writerFactory(effectiveTarget);
     const { installableFiles: targetFiles, result, skipped } = await writeBundleForInstall(
@@ -1596,9 +1588,7 @@ async function performRemoteInstall(
     }
     // Repository scope: check both record files before anything is written (BR3.5).
     // User scope: check the shared user record and the target folder (BR14.3).
-    const prepared = effectiveTarget.scope === 'repository'
-      ? await prepareRepositoryRecord(ctx, effectiveTarget)
-      : (effectiveTarget.scope === 'user' ? await prepareUserRecord(ctx, effectiveTarget) : undefined);
+    const prepared = await prepareRecordForTarget(ctx, effectiveTarget);
     const writerFactory = createWriterFactory(ctx, opts, prepared?.exclusion);
     const writer = writerFactory(effectiveTarget);
     const { installableFiles: targetFiles, result, skipped } = await writeBundleForInstall(
