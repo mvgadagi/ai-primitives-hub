@@ -24,7 +24,6 @@
  */
 import * as path from 'node:path';
 import {
-  type BundleRecord,
   compareCodeUnits,
   FORBIDDEN_KEYS,
   type InstallRecord,
@@ -54,6 +53,10 @@ import {
   confinePath,
   resolveDeleteTarget,
 } from './confine-path';
+import {
+  hashRecordedFile,
+  putToolEntry,
+} from './record-entry';
 import {
   removeExcluded,
 } from './git-root';
@@ -311,12 +314,6 @@ const MERGED_MCP_CONFIG_PATHS = mergedMcpConfigPaths();
 export const isMergedMcpConfigPath = (relative: string, workspacePrefix = ''): boolean =>
   MERGED_MCP_CONFIG_PATHS.some((mcpPath) => relative === (workspacePrefix === '' ? mcpPath : `${workspacePrefix}/${mcpPath}`));
 
-const createBundle = (): BundleRecord => {
-  const bundle = Object.create(null) as BundleRecord;
-  bundle.tools = Object.create(null) as BundleRecord['tools'];
-  return bundle;
-};
-
 /**
  * Prototype-free copy of a recorded file's path and checksum.
  * @param file - Recorded file to copy.
@@ -490,12 +487,9 @@ export class InstallRecordService {
       if (files.has(relative) || isMergedMcpConfigPath(relative, workspacePrefix)) {
         continue;
       }
-      const file = Object.create(null) as RecordedFile;
-      file.path = relative;
-      file.checksum = await this.fs.hashFile(path.join(root, ...relative.split('/')));
-      files.set(relative, file);
+      files.set(relative, await hashRecordedFile(this.fs, root, relative));
     }
-    return [...files.values()].toSorted((a, b) => compareCodeUnits(a.path, b.path));
+    return [...files.values()];
   }
 
   /**
@@ -687,7 +681,7 @@ export class InstallRecordService {
     const target = await this.store.load(location);
     const otherLocation = otherRepositoryLocation(location);
     const other = otherLocation === undefined ? undefined : await this.store.load(otherLocation);
-    const files = await this.toRecordedFiles(location.root, input.writtenPaths, input.workspaceRoot);
+    const written = await this.toRecordedFiles(location.root, input.writtenPaths, input.workspaceRoot);
 
     const previous = [this.removeEntry(target.record, bundleId, tool)];
     const moved = other === undefined ? undefined : this.removeEntry(other.record, bundleId, tool);
@@ -697,16 +691,13 @@ export class InstallRecordService {
       this.dropUnusedSource(other.record, moved.sourceId);
     }
 
-    const entry = Object.create(null) as ToolEntry;
-    entry.version = input.version;
-    entry.sourceId = input.source.sourceId;
-    entry.sourceType = input.sourceType;
-    entry.installedAt = this.now().toISOString();
-    entry.files = files;
-    if (!Object.hasOwn(target.record.bundles, bundleId)) {
-      target.record.bundles[bundleId] = createBundle();
-    }
-    target.record.bundles[bundleId].tools[tool] = entry;
+    const { files } = putToolEntry(target.record, bundleId, tool, {
+      version: input.version,
+      sourceId: input.source.sourceId,
+      sourceType: input.sourceType,
+      installedAt: this.now().toISOString(),
+      files: written
+    });
     target.record.sources[input.source.sourceId] = source;
 
     const loaded = other === undefined ? [target] : [target, other];
@@ -900,10 +891,7 @@ export class InstallRecordService {
     // The store's load checked that the source exists.
     const source = from.record.sources[entry.sourceId];
     this.dropUnusedSource(from.record, entry.sourceId);
-    if (!Object.hasOwn(to.record.bundles, bundleId)) {
-      to.record.bundles[bundleId] = createBundle();
-    }
-    to.record.bundles[bundleId].tools[tool] = entry;
+    putToolEntry(to.record, bundleId, tool, entry);
     to.record.sources[entry.sourceId] = source;
 
     const saved = await this.store.save(targetLocation, to.record);
