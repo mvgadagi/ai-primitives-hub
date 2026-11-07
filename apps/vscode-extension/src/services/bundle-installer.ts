@@ -540,7 +540,6 @@ export class BundleInstaller {
     await this.removeBundleCache(bundleId);
   }
 
-
   /**
    * One information message for sibling entries sharing the bundle's files
    * that this install did not bring to the new version (BR11.4, BR11.6).

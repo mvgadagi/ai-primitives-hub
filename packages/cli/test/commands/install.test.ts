@@ -86,12 +86,12 @@ import {
   makeGitWorktree,
   makeRun,
   readExcludeLines,
+  readInstallRecord,
   readRecord,
   recordPathIn,
-  writeRecord,
-  readInstallRecord,
   userRecordPath,
   workspaceEnv,
+  writeRecord,
 } from '../helpers/install-record-fixtures';
 
 const COMMAND_CLASSES = [
