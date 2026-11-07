@@ -152,7 +152,10 @@ export async function getInstalledBundleForScope(
   }
 
   // User and workspace scopes use RegistryStorage; at user scope, the shared
-  // user record's host-tool item when RegistryStorage has none (BR16.x).
+  // user record's host-tool item when RegistryStorage has none (BR16.x), or
+  // its item for a migrated bundle whose only entry is `unknown` (BR21.4), as
+  // RegistryManager finds it for an uninstall: the scope commands refuse a
+  // move of that item with the reinstall hint before they look it up.
   const stored = await storage.getInstalledBundle(bundleId, scope);
   if (stored !== undefined || scope !== 'user') {
     return stored;
@@ -160,7 +163,7 @@ export async function getInstalledBundleForScope(
   try {
     const adapter = userRecord?.adapter
       ?? new ExtensionRecordAdapter({ sources: { listSources: () => storage.getSources() }, userRecordPath: storage.getPaths().userRecord });
-    return await findUserRecordBundle({ adapter, storage, listing: userRecord?.listing }, bundleId);
+    return await findUserRecordBundle({ adapter, storage, listing: userRecord?.listing }, bundleId, { withLoneUnknown: true });
   } catch (error) {
     logger.warn(`[bundleScopeUtils] Failed to read the user record for bundle ${bundleId}:`, error instanceof Error ? error : undefined);
     return undefined;
