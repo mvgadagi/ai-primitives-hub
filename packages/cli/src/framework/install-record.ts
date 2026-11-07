@@ -795,45 +795,71 @@ export const prepareRecordSelection = async (
 };
 
 /**
- * A read-only record selection with its entries, used by `update` and
- * `uninstall <bundle-id>` run with no inferred target (BR23.3): the record
- * decides which tools act, and nothing has been migrated or written yet.
+ * A record selection with its entries. With no target it is what `update`
+ * and `uninstall <bundle-id>` decide on when no target is inferred (BR23.3):
+ * the record decides which tools act, and nothing has been migrated or
+ * written yet ({@link migrateDecision} migrates it).
  */
 export interface RecordDecision {
-  /** What the person typed that fixes the level (`--lockfile`, `--scope`); never a target. */
+  /** What the person typed that fixes the level (`--lockfile`, `--scope`). */
   input: Omit<RecordSelectionInput, 'write'>;
-  /** The selection, made with no target: the level from `--lockfile`, then `--scope`, then the default rule (BR6.2). */
+  /** The target the selection was made for, when there is one. */
+  target?: Target;
+  /** The selection: the level from `--lockfile`, then `--scope`, then the target or the default rule (BR6.1, BR6.2). */
   prepared: PreparedRecordSelection;
   /** Every (bundle, tool) entry of the selected 3.0.0 record files; bundles only an older store lists are not here. */
   rows: StatusRow[];
 }
 
 /**
- * Select the record with no target and list its entries (BR23.3). With
- * `options.write`, the level is migrated first (BR18.1); without it nothing is
- * migrated or written, so a command the record does not decide can still fail
- * with nothing changed (NFR4.27).
+ * Select the record and list its entries: with no target, the level the
+ * record decides on (BR23.3); with one, the level for that target (BR6.1).
+ * With `options.write`, the level is migrated first (BR18.1); without it
+ * nothing is migrated or written, so a command the record does not decide can
+ * still fail with nothing changed (NFR4.27).
  * @param ctx - CLI context.
  * @param input - Command name and the `--lockfile` / `--scope` values typed.
- * @param options - `write`: migrate the level first (a real run, never `--dry-run`).
+ * @param options - `write`: migrate the level first (a real run, never `--dry-run`); `target`: the effective target.
  * @param options.write - `true` to migrate before selecting.
+ * @param options.target - Effective target the level is selected for, when there is one.
  * @returns The selection and its entries.
  * @throws {RegistryError} A `RECORD.*` error naming the command and the file.
  */
 export const prepareRecordDecision = async (
   ctx: Context,
   input: Omit<RecordSelectionInput, 'write'>,
-  options: { write?: boolean } = {}
+  options: { write?: boolean; target?: Target } = {}
 ): Promise<RecordDecision> => {
-  const prepared = await prepareRecordSelection(ctx, { ...input, write: options.write === true });
+  const { target } = options;
+  const prepared = await prepareRecordSelection(ctx, { ...input, write: options.write === true }, target);
   const { selection, service } = prepared;
   try {
     const rows = selection.locations.length === 0 ? [] : await service.listEntries(selection.locations);
-    return { input, prepared, rows };
+    return { input, ...(target === undefined ? {} : { target }), prepared, rows };
   } catch (error) {
     throw isRecordError(error) ? toCommandRecordError(input.command, error) : error;
   }
 };
+
+/**
+ * The decision a real run acts on: the read-only decision only chose the
+ * path, so the record is selected again with `write` and the level migrated
+ * first (BR18.1). A dry run keeps the read-only decision and never migrates.
+ * The migration can change the entries, so the caller checks the rows of the
+ * returned decision again.
+ * @param ctx - CLI context.
+ * @param decision - The read-only decision.
+ * @param options - `dryRun`: a preview.
+ * @param options.dryRun - `true` for `--dry-run`.
+ * @returns The post-migration decision, or `decision` itself for a dry run.
+ * @throws {RegistryError} A `RECORD.*` error naming the command and the file.
+ */
+export const migrateDecision = async (
+  ctx: Context,
+  decision: RecordDecision,
+  options: { dryRun?: boolean } = {}
+): Promise<RecordDecision> =>
+  options.dryRun === true ? decision : prepareRecordDecision(ctx, decision.input, { write: true, target: decision.target });
 
 /**
  * The tools a bundle has entries for in a decision's rows, in row order.
@@ -853,10 +879,9 @@ export type PreparedUnknownUninstall =
 
 /**
  * Target-free prepare for `uninstall <bundle-id>` of a lone `unknown` entry
- * with no inferred target (BR23.3, BR21.3). The read-only decision only chose
- * the path: this selects the record again with `write` so the level is
- * migrated first (never under `--dry-run`, BR18.1), then reads the entry from
- * the post-migration records. No keep-path set is needed, because
+ * with no inferred target (BR23.3, BR21.3). The level is migrated first
+ * ({@link migrateDecision}; never under `--dry-run`, BR18.1), then the entry
+ * is read from the post-migration records. No keep-path set is needed, because
  * {@link recordUnknownUninstall} keeps every file.
  * @param ctx - CLI context.
  * @param decision - The read-only decision that found the lone `unknown` entry.
@@ -872,7 +897,7 @@ export const prepareUnknownUninstall = async (
   bundleId: string,
   options: { dryRun?: boolean } = {}
 ): Promise<PreparedUnknownUninstall> => {
-  const migrated = options.dryRun === true ? decision : await prepareRecordDecision(ctx, decision.input, { write: true });
+  const migrated = await migrateDecision(ctx, decision, options);
   const tools = recordedTools(migrated.rows, bundleId);
   if (tools.length !== 1 || tools[0] !== UNKNOWN_TOOL_NAME) {
     return { changed: migrated };
