@@ -103,7 +103,7 @@ Bundle files are copied to the target byte-for-byte and verified after every wri
 - **Post-write verification** — after each write, the installed file is re-read and compared against the bytes the writer intended to write (`verifyWrittenBytes` in `core`'s `domain/install/integrity`). A mismatch throws `FileIntegrityError` (`BUNDLE.INTEGRITY_MISMATCH`) instead of leaving a silently corrupted artifact.
 - **Executable bits** (issue #577) — extractors tag each file's bytes with the permission bits its source recorded, using `withFileMode` (`ExtractedFile.mode`, `rwxrwxrwx` only): `ZipBundleExtractor` from the zip entry's Unix mode, `readLocalBundle` from `FileSystem.stat`. Map copies keep the mode; a byte copy drops it, which means "default mode". Both writers (`FileTreeTargetWriter`, `RepositoryScopeWriter`) call `applyFileMode` (`core`'s `domain/install/file-mode`) after each verified write; it calls the optional `FileSystem.setExecutable`. `NodeFileSystem.setExecutable` adds execute where read is granted (or clears every execute bit for a non-executable entry), never adds write or special bits, and does nothing on Windows. It is best effort: a `chmod` rejected with `EPERM`, `ENOTSUP`, `EOPNOTSUPP` or `EINVAL` (vfat/exFAT mounts, files owned by another user) leaves the mode unchanged instead of failing the install; other errors still propagate. Archives that resolvers synthesize with `buildZip` (`skills`, `awesome-copilot`) record `0644` for every entry. Filesystems without `setExecutable` (in-memory test doubles, the VS Code extension's writer filesystem) keep today's behaviour. Install records store no mode.
 - **Upstream layers already verified** — zip entry CRC-32 is checked during extraction, and governed (`formatVersion: 1`) deployment manifests carry per-file `size` + `sha256` validated against the extracted bytes.
-- **Record checksums** — `InstallRecordService.recordInstall` hashes each written file as it is on disk after the write, so a transformed file's checksum matches what the local-modification check reads. The older 2.0.0 lockfile, still written by the CLI's workspace scope and `profile activate`, keeps `checksumFiles` over the extracted (archive) bytes.
+- **Record checksums** — `InstallRecordService.recordInstall` hashes each written file as it is on disk after the write, so a transformed file's checksum matches what the local-modification check reads. The older 2.0.0 lockfile, still written by the CLI's workspace scope, keeps `checksumFiles` over the extracted (archive) bytes.
 
 ## Scope Selection
 
@@ -196,7 +196,7 @@ Installs at repository and user level are recorded in format `3.0.0` install rec
 
 Each bundle holds one entry per tool under `bundles.<id>.tools.<tool>` (version, `sourceId`, `sourceType`, `installedAt`, and the files it wrote with `sha256:` checksums). The commit mode is implied by the file an entry is in, and one bundle's tools can be split across the two repository files. Entries migrated from older files whose tool is not known use the tool `unknown` with `needsReinstall: true`. Unknown fields are kept on write.
 
-The CLI's workspace scope and `profile activate` still use the older 2.0.0 lockfile (`packages/app/src/stores/json-lockfile-store.ts`); otherwise it is kept for an old-format `--lockfile` and to read and migrate older files.
+The CLI's workspace scope still uses the older 2.0.0 lockfile (`packages/app/src/stores/json-lockfile-store.ts`); otherwise it is kept for an old-format `--lockfile` and to read and migrate older files.
 
 ### Components
 

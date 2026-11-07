@@ -74,10 +74,8 @@ installed-record paths of decision 1.
   per-profile records, so an install made in one profile or in the CLI is
   visible everywhere.
 - **Positive:** the record names match the product name; the old
-  `prompt-registry.*` names remain only as migration sources and in what CLI
-  `profile activate` writes for repository targets (see below). The CLI's
-  workspace scope and user-target `profile activate` write the CLI's old user
-  lockfile.
+  `prompt-registry.*` names remain only as migration sources. The CLI's
+  workspace scope writes the CLI's old user lockfile.
 - **Negative:** older releases (CLI 0.2.x, extension releases before this
   change) do not find the renamed files; both deliveries should be upgraded,
   or rolled back, together. Rolling back needs manual steps (see the
@@ -85,11 +83,11 @@ installed-record paths of decision 1.
 - **Negative:** migrated entries without a known tool appear as `unknown` and
   must be reinstalled before the extension can move them or switch their
   commit mode.
-- **Negative:** CLI `profile activate` and workspace scope still use the
-  2.0.0 files. For repository targets, bundles `profile activate` writes
-  become `unknown` entries on the next record change; for user targets they
-  are not seen at user level once the old user lockfile was imported. This is
-  a known follow-up.
+- **Negative:** the CLI's workspace scope still uses the 2.0.0 user lockfile.
+  Bundles a CLI `profile activate` wrote before this change become `unknown`
+  entries; `profile deactivate` keeps them and their files.
+- **Negative:** the record keeps one entry per bundle and tool at a level, so
+  `profile activate` refuses two targets of the same type at one level.
 - **Negative:** with two or more targets, more CLI commands need `--target`.
 
 ## Alternatives Rejected

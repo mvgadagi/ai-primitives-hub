@@ -94,9 +94,11 @@ export const findProjectLockfile = async (ctx: Context): Promise<string | null> 
  *
  * This is not the current install record (format 3.0.0,
  * `ai-primitives-hub.lock.json` / the shared user record; see
- * `framework/install-record.ts`). It resolves the older files still used by
- * `profile activate`, workspace scope and an old-format `--lockfile`, and
- * read as migration sources: for `repository` scope one of
+ * `framework/install-record.ts`). Only workspace scope still records
+ * installs through it (the CLI's old user lockfile); the repository-scope
+ * paths serve the `uninstall` / `update` fallbacks for a bundle only an
+ * older file lists. Also used for an old-format `--lockfile`. For
+ * `repository` scope it is one of
  * `prompt-registry.lock.json` (`commit`) or `prompt-registry.local.lock.json`
  * (`local-only`) under `target.rootPath` (falling back to `ctx.cwd()`); for
  * every other scope the CLI's old single-file user lockfile
