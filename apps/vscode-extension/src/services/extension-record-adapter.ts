@@ -18,7 +18,7 @@
  *   pre-write home check of the user target folders, the other-tool refusal
  *   and the profile-retirement order (unsync, then remove the installation);
  * - `migrateBeforeWrite` (U5; BR18.1, BR18.2, BR20.2, BR22.2): app's
- *   `migrateRecords` for a level before an action's first record change, with
+ *   `migrateLevel` for a level before an action's first record change, with
  *   this profile's RegistryStorage user installs as host-tool entries, and the
  *   report shown once;
  * - the old `prompt-registry.lock.json` files at the record root, read only
@@ -38,7 +38,7 @@ import {
   type LockfileBundleEntry,
   type LockfileFs,
   type MigratedEntry,
-  migrateRecords,
+  migrateLevel,
   type MigrationReport,
   orderConfiguredSources,
   readLockfile,
@@ -46,7 +46,6 @@ import {
   type RecordSourceDescriptor,
   type RecordSourceInput,
   type RecordStore,
-  resolveUserConfigPaths,
   resolveUserHome,
   toRecordSource,
   writeFileAtomically,
@@ -788,7 +787,7 @@ export class ExtensionRecordAdapter {
    * action's first record change (W24; BR18.1, BR18.2). Called only at the
    * write entry points, never from a lookup or a listing.
    *
-   * - repository level: app's `migrateRecords` at the git root of `root`,
+   * - repository level: app's `migrateLevel` at the git root of `root`,
    *   which renames and merges `prompt-registry.lock.json` and
    *   `prompt-registry.local.lock.json` there;
    * - user level, outside WSL: the same on the user record, importing the
@@ -814,15 +813,7 @@ export class ExtensionRecordAdapter {
       const profileEntries = level === 'user' ? await this.buildProfileEntries() : [];
       let report: MigrationReport | undefined;
       try {
-        report = await migrateRecords({
-          store: this.store,
-          fs: this.fs,
-          level,
-          root: targets[0].root,
-          targets,
-          ...(level === 'user' ? { oldUserLockfile: resolveUserConfigPaths(this.env).userLockfile, profileEntries } : {}),
-          now: () => new Date()
-        });
+        report = await migrateLevel({ store: this.store, fs: this.fs, targets, env: this.env, profileEntries });
       } catch (error) {
         this.showRecordError(error, [], targets[0].root);
         throw error;

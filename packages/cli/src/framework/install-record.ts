@@ -10,7 +10,7 @@
  * and the `level` / `records` JSON fields. User level records into the
  * shared user record (`AppStoragePaths.userRecord`, rooted at home); the old
  * 2.0.0 user lockfile is read but never written here. The writing helpers
- * run `migrateRecords` for their level before the first record change
+ * run app's `migrateLevel` for their level before the first record change
  * (BR18.1): repository level renames and merges the old `prompt-registry.*`
  * files at the git root; user level imports the old user lockfile once. Reads
  * (`status`), workspace scope and an old-format `--lockfile` never migrate.
@@ -25,7 +25,7 @@ import {
   type InstallRecordServices,
   type Lockfile,
   type LockfileSourceEntry,
-  migrateRecords,
+  migrateLevel,
   type MigrationReport,
   orderConfiguredSources,
   readLockfile,
@@ -119,36 +119,6 @@ export interface PreparedRepositoryRecord {
   /** What the migration run before this action did; absent when there was nothing to migrate (BR22.1). */
   migration?: MigrationReport;
 }
-
-/**
- * Migrate the old stores of a level into its loaded record files before the
- * first record change (BR18.1). The level root is the locations' root: the
- * git root for both repository files, home for the user record, whose old
- * user lockfile is imported once (BR20.1).
- * @param ctx - CLI context, for the old user lockfile path.
- * @param store - Store the locations are loaded with.
- * @param fs - Filesystem port.
- * @param targets - Both repository files, or the user record.
- * @returns The report, or `undefined` when there was nothing to migrate.
- * @throws {RegistryError} A `RECORD.*` error naming the file.
- */
-const migrateLevel = async (
-  ctx: Context,
-  store: RecordStore,
-  fs: RecordFs,
-  targets: readonly RecordLocation[]
-): Promise<MigrationReport | undefined> => {
-  const level = targets[0].level;
-  return migrateRecords({
-    store,
-    fs,
-    level,
-    root: targets[0].root,
-    targets,
-    ...(level === 'user' ? { oldUserLockfile: resolveUserConfigPaths(ctx.env).userLockfile } : {}),
-    now: () => new Date()
-  });
-};
 
 /**
  * The text lines of a migration report, printed before the `Record:` line (BR22.1).
@@ -344,7 +314,7 @@ export const prepareRepositoryRecord = async (
 ): Promise<PreparedRepositoryRecord> => {
   try {
     const records = await openRepositoryRecords(ctx, target, fs);
-    const migration = await migrateLevel(ctx, records.store, fs, records.locations);
+    const migration = await migrateLevel({ store: records.store, fs, targets: records.locations, env: ctx.env });
     for (const location of records.locations) {
       await records.store.load(location);
     }
@@ -405,7 +375,7 @@ export const prepareUserRecord = async (
     for (const folder of folders) {
       await assertUserFolderInsideHome(fs, home, folder);
     }
-    const migration = await migrateLevel(ctx, store, fs, [location]);
+    const migration = await migrateLevel({ store, fs, targets: [location], env: ctx.env });
     await store.load(location);
     return { location, service, workspaceRoot: home, ...(migration === undefined ? {} : { migration }) };
   } catch (error) {
@@ -531,7 +501,7 @@ export const prepareRepositoryUninstall = async (
   try {
     const { store, service, locations, location, exclusion } = await openRepositoryRecords(ctx, target, fs, options.locations);
     const given = options.locations !== undefined && options.locations.length > 0;
-    const migration = options.dryRun === true || given ? undefined : await migrateLevel(ctx, store, fs, locations);
+    const migration = options.dryRun === true || given ? undefined : await migrateLevel({ store, fs, targets: locations, env: ctx.env });
     const records: InstallRecord[] = [];
     for (const each of locations) {
       records.push((await store.load(each)).record);
@@ -611,7 +581,7 @@ export const prepareUserUninstall = async (
   try {
     const location = userRecordLocation(store, ctx.env);
     await store.load(location);
-    const migration = options.dryRun === true ? undefined : await migrateLevel(ctx, store, fs, [location]);
+    const migration = options.dryRun === true ? undefined : await migrateLevel({ store, fs, targets: [location], env: ctx.env });
     const { record } = await store.load(location);
     const entries = await service.entriesForTool([location], target.type);
     // Once the old user lockfile was imported, the user level no longer reads it (BR20.1).
@@ -827,7 +797,7 @@ export const prepareRecordSelection = async (
       const targets = selection.level === 'user' ? selection.locations : await store.resolveRepository({ start: selection.root });
       // A `--lockfile` record outside the git root is never migrated.
       if (targets[0].root === selection.root) {
-        migration = await migrateLevel(ctx, store, fs, targets);
+        migration = await migrateLevel({ store, fs, targets, env: ctx.env });
         selection = await select();
       }
     }
