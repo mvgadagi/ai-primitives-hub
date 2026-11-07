@@ -34,6 +34,7 @@ import {
   type RecordFs,
   type RecordLevel,
   type RecordLocation,
+  otherRepositoryLocation,
   relativeInside,
   repositoryLocations,
   type SourceRecord,
@@ -433,18 +434,6 @@ export class InstallRecordService {
   }
 
   /**
-   * The other repository file at the same root, if the location is a repository file.
-   * @param location - Target location.
-   */
-  private otherLocation(location: RecordLocation): RecordLocation | undefined {
-    if (location.level !== 'repository') {
-      return undefined;
-    }
-    const [committed, localOnly] = repositoryLocations(location.root);
-    return location.commitMode === 'local-only' ? committed : localOnly;
-  }
-
-  /**
    * An absolute written path as a path relative to the root, before confinement.
    * Falls back to real paths when the root was given through a symlink (e.g.
    * `/var` and `/private/var` on macOS).
@@ -678,7 +667,7 @@ export class InstallRecordService {
     const source: SourceRecord = sanitizeSource(input.source);
     const { location, bundleId, tool } = input;
     const target = await this.store.load(location);
-    const otherLocation = this.otherLocation(location);
+    const otherLocation = otherRepositoryLocation(location);
     const other = otherLocation === undefined ? undefined : await this.store.load(otherLocation);
     const files = await this.toRecordedFiles(location.root, input.writtenPaths, input.workspaceRoot);
 
@@ -763,7 +752,7 @@ export class InstallRecordService {
   public async recordUninstall(input: { location: RecordLocation; bundleId: string; tool: string }): Promise<RecordInstallResult> {
     const { location, bundleId, tool } = input;
     const first = await this.store.load(location);
-    const otherLocation = this.otherLocation(location);
+    const otherLocation = otherRepositoryLocation(location);
     const loaded = otherLocation === undefined ? [first] : [first, await this.store.load(otherLocation)];
 
     const changed: { file: LoadedRecord; entry: ToolEntry }[] = [];
@@ -820,7 +809,7 @@ export class InstallRecordService {
    */
   public async uninstallEntry(input: UninstallEntryInput): Promise<UninstallEntryResult> {
     const { location, bundleId, tool } = input;
-    const other = this.otherLocation(location);
+    const other = otherRepositoryLocation(location);
     const recorded: RecordedFile[] = [];
     for (const file of other === undefined ? [location] : [location, other]) {
       const { record } = await this.store.load(file);
@@ -872,7 +861,7 @@ export class InstallRecordService {
    */
   public async moveEntry(input: MoveEntryInput): Promise<MoveEntryResult> {
     const { location, bundleId, tool } = input;
-    const targetLocation = this.otherLocation(location);
+    const targetLocation = otherRepositoryLocation(location);
     if (targetLocation === undefined) {
       throw recordError('RECORD.MALFORMED', { file: path.basename(location.path), detail: 'only a repository entry can change commit mode' });
     }
@@ -1074,7 +1063,7 @@ export class InstallRecordService {
     for (const change of changes) {
       let listed = listedByRecord.get(change.location.path);
       if (listed === undefined) {
-        const other = this.otherLocation(change.location);
+        const other = otherRepositoryLocation(change.location);
         const locations = other === undefined ? [change.location] : [change.location, other];
         const records: InstallRecord[] = [];
         for (const location of locations) {
