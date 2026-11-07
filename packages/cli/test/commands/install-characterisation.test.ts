@@ -13,8 +13,11 @@
  * Repository-scope installs now write the 3.0.0 install record
  * (`ai-primitives-hub.lock.json` / `.local.lock.json`), so their `lockEntry`
  * is read from `bundles.<id>.tools.<type>` (root-relative `path`,
- * `sha256:` checksums, plus the record file); every other output, including
- * what uninstall leaves behind, is unchanged.
+ * `sha256:` checksums, plus the record file). User-scope installs write the
+ * shared 3.0.0 user record (`<XDG_CONFIG_HOME>/ai-primitives-hub/
+ * ai-primitives-hub.user.lock.json`) in the same shape, with paths relative
+ * to home, and never the old 2.0.0 user lockfile. Every other output,
+ * including what uninstall leaves behind, is unchanged.
  *
  * The fixture data is owned by this file on purpose: it does not reuse the
  * `doctor diagnostics --primitives` fixture, which evolves independently.
@@ -68,6 +71,9 @@ import {
   createTestContext,
   runCli,
 } from '../../src/framework';
+import {
+  userRecordPath,
+} from '../helpers/install-record-fixtures';
 
 const REVISION = 'abcdef0123456789abcdef0123456789abcdef01';
 const COLLECTION_FILE = 'collections/example.collection.yml';
@@ -330,18 +336,30 @@ interface LockFileEntry {
 }
 
 interface LockEntry {
-  /** Install record file the entry came from (repository scope, format 3.0.0 only). */
+  /** Install record file the entry came from (format 3.0.0 only). */
   record?: string;
   version: string;
   sourceType: string;
   files: LockFileEntry[];
 }
 
-/** Repository install record files (format 3.0.0) and their snapshot labels. */
-const RECORD_FILES = ['ai-primitives-hub.lock.json', 'ai-primitives-hub.local.lock.json'];
+/**
+ * Install record files (format 3.0.0) the sandbox may hold, labelled for the
+ * snapshot: the repository records in the workspace (root-relative paths) and
+ * the shared user record (home-relative paths).
+ * @param sandbox - Sandbox.
+ */
+const recordFiles = (sandbox: Sandbox): [label: string, file: string][] => {
+  const userRecord = userRecordPath(sandbox.env);
+  return [
+    ...['ai-primitives-hub.lock.json', 'ai-primitives-hub.local.lock.json']
+      .map((name): [string, string] => [`<workspace>/${name}`, path.join(sandbox.workspace, name)]),
+    [`<xdg-config>/${path.relative(sandbox.env.XDG_CONFIG_HOME, userRecord).split(path.sep).join('/')}`, userRecord]
+  ];
+};
 
 /**
- * The bundle's entry for `targetType` in a repository install record
+ * The bundle's entry for `targetType` in an install record
  * (`bundles.<id>.tools.<type>`), without its timestamp and with files
  * sorted by installed path.
  * @param sandbox - Sandbox.
@@ -349,8 +367,8 @@ const RECORD_FILES = ['ai-primitives-hub.lock.json', 'ai-primitives-hub.local.lo
  * @param targetType - Target type (the record's tool key).
  */
 const readRecordEntry = async (sandbox: Sandbox, bundleId: string, targetType: string): Promise<LockEntry | null> => {
-  for (const name of RECORD_FILES) {
-    const text = await readOptional(path.join(sandbox.workspace, name));
+  for (const [label, recordFile] of recordFiles(sandbox)) {
+    const text = await readOptional(recordFile);
     if (text === null) {
       continue;
     }
@@ -358,7 +376,7 @@ const readRecordEntry = async (sandbox: Sandbox, bundleId: string, targetType: s
     const entry = record.bundles?.[bundleId]?.tools?.[targetType];
     if (entry !== undefined) {
       return {
-        record: `<workspace>/${name}`,
+        record: label,
         version: entry.version,
         sourceType: entry.sourceType,
         files: entry.files
@@ -372,8 +390,9 @@ const readRecordEntry = async (sandbox: Sandbox, bundleId: string, targetType: s
 
 /**
  * The bundle's lockfile entry from whichever lockfile the install wrote,
- * without timestamps and with files sorted by path. Repository-scope
- * installs write the install record, read from `bundles.<id>.tools.<type>`.
+ * without timestamps and with files sorted by path. Repository- and
+ * user-scope installs write an install record, read from
+ * `bundles.<id>.tools.<type>`.
  * @param sandbox - Sandbox.
  * @param bundleId - Bundle id.
  * @param targetType - Target type, the install record's tool key.
@@ -384,7 +403,6 @@ const readLockEntry = async (sandbox: Sandbox, bundleId: string, targetType: str
     return recorded;
   }
   const candidates = [
-    resolveUserConfigPaths(sandbox.env).userLockfile,
     path.join(sandbox.workspace, 'prompt-registry.lock.json'),
     path.join(sandbox.workspace, 'prompt-registry.local.lock.json')
   ];
@@ -456,6 +474,8 @@ const runCase = async (
   const excludePath = path.join(sandbox.workspace, '.git', 'info', 'exclude');
   const gitExclude = normalizeExclude(await readOptional(excludePath));
   const lockEntry = await readLockEntry(sandbox, bundleId, spec.targetType);
+  // No install writes the old 2.0.0 user lockfile any more: user scope records in the user record.
+  expect(await readOptional(resolveUserConfigPaths(sandbox.env).userLockfile)).toBeNull();
   await run(sandbox, ['uninstall', '--target', 't', '--all', ...commitMode, '-o', 'json']);
   return {
     targetAdd: { effectiveScope: (added.envelope.data?.target as { scope?: string } | undefined)?.scope ?? null },

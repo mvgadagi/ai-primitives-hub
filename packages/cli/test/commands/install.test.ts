@@ -56,6 +56,9 @@ import {
   InstallCommand,
 } from '../../src/commands/install';
 import {
+  SourceAddCommand,
+} from '../../src/commands/source';
+import {
   TargetAddCommand,
 } from '../../src/commands/target-add';
 import {
@@ -83,8 +86,11 @@ import {
   makeGitWorktree,
   makeRun,
   readExcludeLines,
+  readInstallRecord,
   readRecord,
   recordPathIn,
+  userRecordPath,
+  workspaceEnv,
   writeRecord,
 } from '../helpers/install-record-fixtures';
 
@@ -231,7 +237,23 @@ describe('install command (local --from mode)', () => {
     const tokens = { getToken: () => Promise.reject(new Error('GitHub credentials must not be used')) };
     const context = () => createTestContext({ cwd: workspace, fs: new NodeFileSystem(), env });
     const target: Target = { name: 'copilot', type: 'copilot-cli', scope: 'user', path: targetDir };
+    // The record replay and update apply the source trust gate (NFR4.11): only a
+    // configured source is fetched with credentials. Configure the Artifactory
+    // source as a user would, as a detached `default-local` source, before installing.
+    let sourceConfigured = false;
+    const configureSource = async () => {
+      if (sourceConfigured) {
+        return;
+      }
+      const added = await runCli([
+        'source', 'add', '--type', 'artifactory', '--url', root, '--id', source.id,
+        '--auth', 'bearer', '--credential-ref', 'ARTIFACTORY_TOKEN', '-o', 'json'
+      ], { ctx: context(), http, tokens, commandClasses: [SourceAddCommand], commands: [], name: 'test', version: 'test' });
+      expect(added).toBe(0);
+      sourceConfigured = true;
+    };
     const install = async (bundleId = catalogId) => {
+      await configureSource();
       const ctx = context();
       const exitCode = await installBundleWithSource(bundleId, source, target, ctx, http, tokens, 'json');
       return { exitCode, ctx, lockPath: JSON.parse(ctx.stdout.captured()).data.lockfile as string };
@@ -268,22 +290,25 @@ describe('install command (local --from mode)', () => {
     const installed = await fixture.install();
     const installEnvelope = JSON.parse(installed.ctx.stdout.captured());
     expect(installEnvelope.data.bundle).toEqual({ id: fixture.catalogId, version: '1.0.0' });
-    const lock = JSON.parse(await readFile(installed.lockPath, 'utf8')) as Lockfile;
+    // User-scope installs are in the user record: one entry per tool, home-relative paths.
+    const lock = await readInstallRecord(installed.lockPath);
     expect(Object.keys(lock.bundles)).toEqual([fixture.catalogId]);
+    expect(lock.bundles[fixture.catalogId].tools['copilot-cli'].files.map((file) => file.path)).toContain('target/prompts/hello.prompt.md');
     expect(lock.sources['artifact-source']).toMatchObject({ type: 'artifactory', credentialRef: 'ARTIFACTORY_TOKEN' });
     expect(JSON.stringify(lock)).not.toContain('reader-token');
     await rm(path.join(targetDir, 'prompts', 'hello.prompt.md'));
     const replay = await fixture.command(['install', '--lockfile', installed.lockPath, '--target', 'copilot', '-o', 'json']);
     expect(replay.exitCode).toBe(0);
-    expect(JSON.parse(replay.ctx.stdout.captured()).data.replayed).toEqual([fixture.catalogId]);
+    expect(JSON.parse(replay.ctx.stdout.captured()).data.replayed)
+      .toEqual([{ bundleId: fixture.catalogId, tool: 'copilot-cli', version: '1.0.0', target: 'copilot' }]);
     await expect(readFile(path.join(targetDir, 'prompts', 'hello.prompt.md'), 'utf8')).resolves.toContain('Hello Prompt');
     fixture.setVersion('2.0.0');
     const updated = await fixture.command(['update', '--lockfile', installed.lockPath, '--target', 'copilot', '--no-hub-sync', '-o', 'json']);
     expect(updated.exitCode).toBe(0);
     expect(JSON.parse(updated.ctx.stdout.captured()).data.updated).toBe(1);
-    const nextLock = JSON.parse(await readFile(installed.lockPath, 'utf8')) as Lockfile;
+    const nextLock = JSON.parse(await readFile(installed.lockPath, 'utf8')) as { bundles: Record<string, { tools: Record<string, { version: string }> }> };
     expect(Object.keys(nextLock.bundles)).toEqual([fixture.catalogId]);
-    expect(nextLock.bundles[fixture.catalogId].version).toBe('2.0.0');
+    expect(nextLock.bundles[fixture.catalogId].tools['copilot-cli'].version).toBe('2.0.0');
     const replayUpdated = await fixture.command(['install', '--lockfile', installed.lockPath, '--target', 'copilot', '-o', 'json']);
     expect(replayUpdated.exitCode).toBe(0);
   });
@@ -343,9 +368,11 @@ describe('install command (local --from mode)', () => {
     const output = result.ctx.stdout.captured();
 
     expect(result.exitCode).toBe(1);
+    // The user record update lists one line per (bundle, tool) entry.
     expect(output).toContain('Available updates (1):');
-    expect(output).toContain(`${secondBundleId}: 1.0.0 → 2.0.0`);
-    expect(output).toContain('Update check is incomplete.');
+    expect(output).toContain(`${secondBundleId} (copilot-cli): 1.0.0 → 2.0.0`);
+    expect(output).toContain('1 update check or installation failed.');
+    expect(result.ctx.stderr.captured()).toContain(fixture.catalogId);
   });
 
   it('shows completed updates alongside installation failures in text output', async () => {
@@ -363,9 +390,11 @@ describe('install command (local --from mode)', () => {
     const output = result.ctx.stdout.captured();
 
     expect(result.exitCode).toBe(1);
-    expect(output).toContain('Updated 1 bundle:');
-    expect(output).toContain(`${secondBundleId}: 1.0.0 → 2.0.0`);
+    // The user record update lists one line per (bundle, tool) entry.
+    expect(output).toContain('Updated 1 entry:');
+    expect(output).toContain(`${secondBundleId} (copilot-cli): 1.0.0 → 2.0.0`);
     expect(output).toContain('1 update check or installation failed.');
+    expect(result.ctx.stderr.captured()).toContain(`Failed to update ${fixture.catalogId}`);
   });
 
   it('rejects an Artifactory latest install with a different embedded version before writing', async () => {
@@ -427,11 +456,10 @@ describe('install command (local --from mode)', () => {
     await expect(readFile(path.join(targetDir, 'metadata', 'source-collection.yml'), 'utf8')).rejects.toThrow();
     await expect(readFile(path.join(targetDir, 'LICENSE'), 'utf8')).rejects.toThrow();
     await expect(readFile(path.join(targetDir, 'ignored', 'build', 'cache.pyc'), 'utf8')).rejects.toThrow();
-    const lockfile = JSON.parse(await readFile(envelope.data.lockfile, 'utf8')) as {
-      bundles: Record<string, { files: { path: string }[] }>;
-    };
-    expect(lockfile.bundles['local-foo'].files.map((file) => file.path)).toEqual([
-      'prompts/hello.prompt.md'
+    // User-scope installs go to the user record: per-tool entries, paths relative to home.
+    const lockfile = await readInstallRecord(envelope.data.lockfile);
+    expect(lockfile.bundles['local-foo'].tools['copilot-cli'].files.map((file) => file.path)).toEqual([
+      'target/prompts/hello.prompt.md'
     ]);
   });
 
@@ -444,11 +472,9 @@ describe('install command (local --from mode)', () => {
     const envelope = parseJson<{ lockfile: string }>(result.stdout);
     await expect(readFile(path.join(targetDir, 'prompts', 'hello.prompt.md'), 'utf8'))
       .resolves.toContain('Hello Prompt');
-    const lockfile = JSON.parse(await readFile(envelope.data.lockfile, 'utf8')) as {
-      bundles: Record<string, { files: { path: string }[] }>;
-    };
-    expect(lockfile.bundles['local-foo'].files.map((file) => file.path)).toEqual([
-      'prompts/hello.prompt.md'
+    const lockfile = await readInstallRecord(envelope.data.lockfile);
+    expect(lockfile.bundles['local-foo'].tools['copilot-cli'].files.map((file) => file.path)).toEqual([
+      'target/prompts/hello.prompt.md'
     ]);
   });
 
@@ -466,8 +492,8 @@ describe('install command (local --from mode)', () => {
     ]);
 
     expect(replay.exitCode).toBe(0);
-    const replayEnvelope = parseJson<{ replayed: string[]; failures: unknown[] }>(replay.stdout);
-    expect(replayEnvelope.data.replayed).toEqual(['local-foo']);
+    const replayEnvelope = parseJson<{ replayed: { bundleId: string }[]; failures: unknown[] }>(replay.stdout);
+    expect(replayEnvelope.data.replayed.map((row) => row.bundleId)).toEqual(['local-foo']);
     expect(replayEnvelope.data.failures).toEqual([]);
     await expect(readFile(path.join(targetDir, 'prompts', 'hello.prompt.md'), 'utf8'))
       .resolves.toContain('Hello Prompt');
@@ -1157,18 +1183,87 @@ agents:
       expect(lines).toContain('.github/prompts/hello.prompt.md');
     });
 
-    it('keeps user-scope installs on the existing user lockfile', async () => {
+    it('records user-scope installs in the user record, never the old user lockfile', async () => {
       const result = await run(['install', 'local-foo', '--from', bundleDir, '--target', 'copilot', '-o', 'json']);
 
       expect(result.exitCode, result.stdout).toBe(0);
-      const userLockfile = resolveUserConfigPaths({
-        HOME: workspace,
-        USERPROFILE: workspace,
-        XDG_CONFIG_HOME: path.join(workspace, 'xdg-config'),
-        XDG_CACHE_HOME: path.join(workspace, 'xdg-cache')
-      }).userLockfile;
-      expect(parseJson<{ lockfile: string }>(result.stdout).data.lockfile).toBe(userLockfile);
+      const env = workspaceEnv(workspace);
+      expect(parseJson<{ lockfile: string }>(result.stdout).data.lockfile).toBe(userRecordPath(env));
+      await expect(readFile(resolveUserConfigPaths(env).userLockfile, 'utf8')).rejects.toThrow();
       await expect(readFile(recordPath(), 'utf8')).rejects.toThrow();
+    });
+  });
+
+  describe('user install record (ai-primitives-hub.user.lock.json)', () => {
+    let userEnv: Record<string, string>;
+    const runUser = (argv: string[]): ReturnType<typeof runCommand> => makeRun(() => workspace, COMMAND_CLASSES, userEnv)(argv);
+    const exists = (file: string): Promise<boolean> => stat(file).then(() => true, () => false);
+
+    beforeEach(async () => {
+      userEnv = {
+        HOME: path.join(workspace, 'home'),
+        USERPROFILE: path.join(workspace, 'profile'),
+        XDG_CONFIG_HOME: path.join(workspace, 'user-xdg-config'),
+        XDG_CACHE_HOME: path.join(workspace, 'user-xdg-cache')
+      };
+      await mkdir(userEnv.HOME, { recursive: true });
+      await mkdir(userEnv.USERPROFILE, { recursive: true });
+    });
+
+    const MALFORMED_RECORD = '{ "version": "3.0.0", ';
+    it.each([
+      {
+        name: 'a target folder outside home',
+        targetFolder: (): string => path.join(workspace, 'outside', 'target'),
+        seedRecord: undefined,
+        error: (): object => ({
+          code: 'RECORD.PATH_OUTSIDE_ROOT',
+          hint: `Use a target under ${path.resolve(userEnv.HOME)} or a repository target.`
+        })
+      },
+      {
+        name: 'a malformed user record',
+        targetFolder: (): string => path.join(userEnv.HOME, 'target'),
+        seedRecord: MALFORMED_RECORD,
+        error: (): object => ({ code: 'RECORD.MALFORMED', context: { file: userRecordPath(userEnv) } })
+      }
+    ])('refuses a user-scope install into $name: exit 1, nothing written', async ({ targetFolder, seedRecord, error }) => {
+      if (seedRecord !== undefined) {
+        await mkdir(path.dirname(userRecordPath(userEnv)), { recursive: true });
+        await writeFile(userRecordPath(userEnv), seedRecord);
+      }
+      expect((await runUser([
+        'target', 'add', 'user-copilot', '--type', 'copilot-cli', '--path', targetFolder(), '-o', 'json'
+      ])).exitCode).toBe(0);
+
+      const result = await runUser(['install', 'local-foo', '--from', bundleDir, '--target', 'user-copilot', '-o', 'json']);
+
+      expect(result.exitCode, result.stdout).toBe(1);
+      expect(parseJson<null>(result.stdout).errors?.[0]).toMatchObject(error());
+      expect(await exists(path.join(targetFolder(), 'prompts', 'hello.prompt.md'))).toBe(false);
+      if (seedRecord === undefined) {
+        expect(await exists(userRecordPath(userEnv))).toBe(false);
+      } else {
+        expect(await readFile(userRecordPath(userEnv), 'utf8')).toBe(seedRecord);
+      }
+    });
+
+    it('writes a default user-scope target under USERPROFILE when HOME is empty and records home-relative paths', async () => {
+      userEnv = {
+        ...userEnv,
+        HOME: '',
+        XDG_DATA_HOME: path.join(workspace, 'user-xdg-data'),
+        XDG_STATE_HOME: path.join(workspace, 'user-xdg-state')
+      };
+      // No --path: the copilot-cli layout's `${HOME}/.copilot` is expanded by the writer.
+      expect((await runUser(['target', 'add', 'user-copilot', '--type', 'copilot-cli', '-o', 'json'])).exitCode).toBe(0);
+
+      const result = await runUser(['install', 'local-foo', '--from', bundleDir, '--target', 'user-copilot', '-o', 'json']);
+
+      expect(result.exitCode, result.stdout).toBe(0);
+      await expect(readFile(path.join(userEnv.USERPROFILE, '.copilot', 'prompts', 'hello.prompt.md'), 'utf8')).resolves.toContain('Hello Prompt');
+      const record = await readInstallRecord(userRecordPath(userEnv));
+      expect(record.bundles['local-foo'].tools['copilot-cli'].files.map((file) => file.path)).toContain('.copilot/prompts/hello.prompt.md');
     });
   });
 

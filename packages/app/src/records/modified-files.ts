@@ -10,9 +10,11 @@
  * old-file form) compares as `sha256:<hex>`.
  *
  * Every path goes through the delete-time confinement check first. A path
- * the check refuses, a leaf that is not a regular file (a symlink is never
- * followed) and a file with no recorded checksum are all treated as modified,
- * so they are kept rather than deleted.
+ * the check refuses, a leaf that is neither a regular file nor a symlink to
+ * one, and a file with no recorded checksum are all treated as modified, so
+ * they are kept rather than deleted. A symlink is compared by the content of
+ * the file it resolves to, so a link the extension made into its bundle cache
+ * is unchanged while that file still matches; a dangling link is modified.
  *
  * `areAllFilesMissing` (stale cleanup) and `isAnyFileMissing` (the listing's
  * "files missing" flag) check only whether recorded paths exist.
@@ -48,6 +50,27 @@ const BARE_SHA256 = /^[0-9a-f]{64}$/;
 const toRecordChecksum = (checksum: string): string => BARE_SHA256.test(checksum) ? `sha256:${checksum}` : checksum;
 
 /**
+ * The regular file whose bytes a recorded leaf holds: the leaf itself, or,
+ * for a symlink (the extension's user-scope files link into its bundle
+ * cache), the file it resolves to. Only the hash is read through the link;
+ * deleting the leaf never touches the target.
+ * @param fs - Filesystem port.
+ * @param leaf - Absolute recorded path, already confined.
+ * @returns The file to hash, or `undefined` for a dangling link or anything that is not a regular file.
+ */
+const contentFile = async (fs: RecordFs, leaf: string): Promise<string | undefined> => {
+  const kind = (await fs.lstat(leaf))?.kind;
+  if (kind === 'file') {
+    return leaf;
+  }
+  if (kind !== 'symlink') {
+    return undefined;
+  }
+  const resolved = await fs.realpath(leaf).catch(() => undefined);
+  return resolved !== undefined && (await fs.lstat(resolved))?.kind === 'file' ? resolved : undefined;
+};
+
+/**
  * Whether one recorded file differs from its checksum or is missing.
  * @param fs - Filesystem port.
  * @param root - Root the paths are relative to.
@@ -55,14 +78,15 @@ const toRecordChecksum = (checksum: string): string => BARE_SHA256.test(checksum
  */
 const isModified = async (fs: RecordFs, root: string, file: RecordedFileCheck): Promise<boolean> => {
   const target = await resolveDeleteTarget(fs, root, file.path);
-  if (target.status !== 'delete') {
+  if (target.status !== 'delete' || file.checksum === undefined) {
     return true;
   }
-  if (file.checksum === undefined || (await fs.lstat(target.absolute))?.kind !== 'file') {
+  const content = await contentFile(fs, target.absolute);
+  if (content === undefined) {
     return true;
   }
   try {
-    return (await fs.hashFile(target.absolute)) !== toRecordChecksum(file.checksum);
+    return (await fs.hashFile(content)) !== toRecordChecksum(file.checksum);
   } catch {
     // A file that cannot be read cannot be shown to be unchanged: keep it.
     return true;

@@ -60,7 +60,6 @@ import {
   ArtifactoryHttpClient,
   createGitHubSourceAuthRuntime,
   defaultTokenProvider,
-  FileSystemLayoutConfigLoader,
   GitHubApiClient,
   HttpsBundleDownloader,
   isGitHubAppAuthEnabled,
@@ -69,7 +68,6 @@ import {
   type RepositoryCommitMode,
   RepositoryScopeWriter,
   RepositoryScopeWriterAdapter,
-  resolveUserConfigDir,
   SourceDispatcher,
   StaticTokenProvider,
   TargetStateStore,
@@ -81,6 +79,7 @@ import {
   configuredSources,
   type Context,
   createHubManager,
+  createLayoutLoader,
   failWith,
   findProjectLockfile,
   finishRecordRun,
@@ -102,6 +101,7 @@ import {
   resolveTarget,
   resolveTargetName,
   tokensForRecordSource,
+  writerEnv,
 } from '../framework';
 
 /**
@@ -262,7 +262,7 @@ export class UpdateCommand extends BaseUpdateCommand {
       // Select the record first: every selected file is loaded and checked
       // before anything is fetched or written (W5 step 1, NFR4.8).
       const prepared = await prepareRecordSelection(ctx, { command: 'update', lockfile: this.lockfile, scope: opts.scope }, target);
-      if (prepared.selection.level === 'repository' && prepared.selection.locations.length > 0) {
+      if (prepared.selection.locations.length > 0) {
         const rows = await prepared.service.listEntries(prepared.selection.locations);
         if (rows.length > 0) {
           if (!this.noHubSync) {
@@ -604,12 +604,8 @@ function writerFor(ctx: Context, target: Target, scope: string, commitMode: Repo
     return new RepositoryScopeWriterAdapter(writer);
   }
   const transformer = TransformerRegistry.withBuiltIns().getTransformer(target.type);
-  const layoutLoader = new FileSystemLayoutConfigLoader({
-    cwd: ctx.cwd(),
-    fs: ctx.fs,
-    userConfigDir: resolveUserConfigDir(ctx.env)
-  });
-  return new FileTreeTargetWriter({ fs: ctx.fs, env: ctx.env, transformer, layoutLoader });
+  const layoutLoader = createLayoutLoader(ctx);
+  return new FileTreeTargetWriter({ fs: ctx.fs, env: writerEnv(ctx.env, effectiveScope), transformer, layoutLoader });
 }
 
 async function applyUpdates(
