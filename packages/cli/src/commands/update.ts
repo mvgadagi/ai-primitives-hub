@@ -110,6 +110,7 @@ import {
   renderRecordLine,
   resolveCommandTarget,
   resolveEffectiveTarget,
+  type TargetOverrides,
   tokensForRecordSource,
   writerEnv,
 } from '../framework';
@@ -270,12 +271,14 @@ export class UpdateCommand extends BaseUpdateCommand {
       // not decide fails below before anything is migrated, written or fetched
       // (NFR4.27).
       const input = { command: 'update', lockfile: this.lockfile, scope: opts.scope };
-      const run: RecordUpdateBase = { ctx, fmt, http, tokens, dryRun: this.dryRun, interactive: this.interactive, noHubSync: this.noHubSync };
+      const run: RecordUpdateBase = {
+        ctx, fmt, http, tokens, overrides: opts, dryRun: this.dryRun, interactive: this.interactive, noHubSync: this.noHubSync
+      };
       const targetName = await inferTargetName(ctx, opts.target);
       if (targetName === undefined) {
-        const code = await runRecordUpdate(run, await prepareRecordWithoutTarget(ctx, input, this.dryRun));
-        if (code !== undefined) {
-          return code;
+        const decided = await runRecordUpdate(run, await prepareRecordWithoutTarget(ctx, input, this.dryRun));
+        if (decided !== undefined) {
+          return decided;
         }
       }
 
@@ -285,9 +288,9 @@ export class UpdateCommand extends BaseUpdateCommand {
       // before anything is fetched or written (W5 step 1, NFR4.8). A real
       // update migrates the selected level first; a dry run never does (BR18.1).
       const decision = await prepareRecordDecision(ctx, input, { write: this.dryRun !== true, target });
-      const code = await runRecordUpdate(run, decision, { target, explicit: this.target !== undefined && this.target.length > 0 ? target : undefined });
-      if (code !== undefined) {
-        return code;
+      const recorded = await runRecordUpdate(run, decision, this.target !== undefined && this.target.length > 0 ? target : undefined);
+      if (recorded !== undefined) {
+        return recorded;
       }
 
       const commitMode = target.commitMode ?? 'commit';
@@ -405,23 +408,21 @@ async function prepareRecordWithoutTarget(
 }
 
 /** What every record-driven update run shares, whatever its target. */
-type RecordUpdateBase = Omit<RecordUpdateRun, 'prepared' | 'target' | 'explicit'> & { noHubSync: boolean };
+type RecordUpdateBase = Omit<RecordUpdateRun, 'prepared' | 'explicit'> & { noHubSync: boolean };
 
 /**
  * Update from the record when its entries decide: sync the active hub unless
  * `--no-hub-sync`, then {@link updateFromRecord} (W5). One path for the run
  * with no inferred target (BR23.3) and the targeted one.
- * @param run Context, clients and flags of the update.
+ * @param run Context, clients, overrides and flags of the update.
  * @param decision The selected record and its entries; none when the record does not decide.
- * @param targets The resolved target (it writes the old-file-only bundles) and the one named by `--target`.
- * @param targets.target Resolved target; absent with no inferred target.
- * @param targets.explicit Target named by `--target`; only it narrows the plan to one tool (BR6.1).
+ * @param explicit The target named by `--target`; only it narrows the plan to one tool (BR6.1).
  * @returns Exit code, or `undefined` when the selected record has no entry (the caller then uses the old store).
  */
 async function runRecordUpdate(
   run: RecordUpdateBase,
   decision: RecordDecision | undefined,
-  targets: { target?: Target; explicit?: Target } = {}
+  explicit?: Target
 ): Promise<number | undefined> {
   if (decision === undefined || decision.rows.length === 0) {
     return undefined;
@@ -430,7 +431,7 @@ async function runRecordUpdate(
   if (!noHubSync) {
     await syncActiveHub(base.ctx);
   }
-  return updateFromRecord({ ...base, ...targets, prepared: decision.prepared });
+  return updateFromRecord({ ...base, ...(explicit === undefined ? {} : { explicit }), prepared: decision.prepared });
 }
 
 /**
@@ -816,14 +817,10 @@ interface RecordUpdateRun {
   http: HttpClient;
   tokens: TokenProvider;
   prepared: PreparedRecordSelection;
-  /**
-   * The resolved target; it writes the old-file-only bundles, as today (BR10.1).
-   * Absent when no target was inferred (BR23.3): each recorded tool maps to its
-   * own target, and old-file-only bundles fail per bundle (BR23.2).
-   */
-  target?: Target;
   /** The target named by `--target`; only it narrows the plan to one tool (BR6.1). */
   explicit?: Target;
+  /** `--scope` / `--commit-mode`, applied to the target inferred for old-file-only bundles (BR10.1). */
+  overrides: TargetOverrides;
   dryRun: boolean;
   interactive: boolean;
 }
@@ -1115,14 +1112,15 @@ async function updateFromRecord(run: RecordUpdateRun): Promise<number> {
  * Update the bundles that are only in the selected level's old
  * `prompt-registry.*` file with today's code, on that file, writing nothing
  * about them into the new record (BR10.1; W5 step 6).
- * @param run Update inputs; `run.target` writes the old-file bundles, as today.
- *   With no target (BR23.3) the only configured target writes them; otherwise
- *   they are reported as per-bundle failures with the missing-target message (BR23.2).
+ * They go to the `--target` target, else the only configured target, with
+ * `--scope` / `--commit-mode` applied, as install does (BR23.2); otherwise
+ * they are reported as per-bundle failures with the missing-target message.
+ * @param run Update inputs.
  * @returns What was checked and updated, or `undefined` when there is no old-file-only bundle.
  */
 async function updateOldFileOnly(run: RecordUpdateRun): Promise<OldFileUpdate | undefined> {
   const { ctx, http, tokens } = run;
-  const old = await prepareOldFileOnly(ctx, run.prepared, { command: 'update', target: run.target });
+  const old = await prepareOldFileOnly(ctx, run.prepared, { command: 'update', target: run.explicit, overrides: run.overrides });
   if (old === undefined) {
     return undefined;
   }
