@@ -15,6 +15,7 @@ import {
   type MigrationReport,
   planRecordEntries,
   readLockfile,
+  type RecordHubInput,
   recordIdentityOf,
   type RecordInstallResult,
   recordKeyForVersion,
@@ -74,7 +75,7 @@ import {
 import {
   CLI_RECORD_GENERATED_BY,
   Command,
-  configuredSources,
+  configuredRecordSources,
   type Context,
   createHubManager,
   createLayoutLoader,
@@ -766,6 +767,10 @@ interface RecordPlanItem {
   target: Target;
   /** `true` when no configured source matched, so the source came from the record. */
   fromRecord: boolean;
+  /** The decided source's hub id. */
+  hubId?: string;
+  /** The hub named by `hubId`, from the configured hubs. */
+  hub?: RecordHubInput;
 }
 
 /** A (bundle, tool) entry that was not updated, and why. */
@@ -866,7 +871,7 @@ async function planRecordUpdates(
     fs,
     selection,
     targets: await readTargetsSafely(loadTargets(ctx)),
-    configured: await configuredSources(ctx),
+    ...await configuredRecordSources(ctx),
     explicit,
     cwd: ctx.cwd(),
     holdingFile: 'listed'
@@ -880,7 +885,9 @@ async function planRecordUpdates(
       sourceId: item.entry.sourceId,
       source: toLockfileSourceEntry(item.source),
       target: resolveEffectiveTarget(ctx, item.target),
-      fromRecord: item.fromRecordOnly
+      fromRecord: item.fromRecordOnly,
+      ...(item.source.hubId === undefined ? {} : { hubId: item.source.hubId }),
+      ...(item.hub === undefined ? {} : { hub: item.hub })
     })),
     skipped: plan.skipped,
     notes: plan.notes,
