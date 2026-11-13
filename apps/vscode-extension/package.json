@@ -1207,7 +1207,7 @@
     "archiver": "^7.0.1",
     "axios": "^1.18.1",
     "fs-extra": "^11.3.6",
-    "glob": "^14.0.0",
+    "glob": "^14.0.4",
     "js-yaml": "^4.3.1",
     "jsonc-parser": "^3.3.1",
     "markdown-it": "^15.0.0",
